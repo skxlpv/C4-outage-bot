@@ -7,6 +7,10 @@ Replicates the exact layout of photo_2026-11-18_14-21-44:
 - Group rows: "Г Р У П А" + bold number
 - 00:00 to 23:00 hour markers (no :30 sub-labels)
 - Zero footer texts
+
+Channel autoposting: add the bot as an administrator (Post Messages) of a
+channel and it posts the current table immediately, then re-posts on every
+change of the schedule on the site.
 """
 from __future__ import annotations
 
@@ -16,7 +20,6 @@ import io
 import json
 import logging
 import os
-import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,15 +35,17 @@ from PIL import Image, ImageDraw, ImageFont
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import Conflict, Forbidden
+from telegram.error import BadRequest, Conflict, Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -54,6 +59,7 @@ load_dotenv()
 # =========================================================================== #
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SUBSCRIBERS_FILE = Path(os.environ.get("SUBSCRIBERS_FILE", "subscribers.json"))
+CHANNELS_FILE = Path(os.environ.get("CHANNELS_FILE", "channels.json"))
 OBLENERGO_URL = os.environ.get("OBLENERGO_URL", "https://oblenergo.cv.ua/shutdowns/")
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL", "30"))
 TZ = ZoneInfo("Europe/Kyiv")
@@ -95,13 +101,17 @@ COLOR_MUTED_GRAY = (120, 144, 156)  # Blue-gray for "Г Р У П А"
 COLOR_LINE_MARKER = (25, 118, 210)  # Blue time indicator line
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+# httpx logs full Telegram URLs (which contain the bot token) at INFO level
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("svitlo-replica-bot")
 
 
 # =========================================================================== #
-# Persistence (Subscribers)
+# Persistence (Subscribers & Channels)
 # =========================================================================== #
 class SubscriberStore:
+    """Persistent set of chat IDs (users have positive IDs, channels negative)."""
+
     def __init__(self, path: Path) -> None:
         self.path = path
         self.subscribers: set[int] = set()
@@ -111,10 +121,15 @@ class SubscriberStore:
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
-                self.subscribers = {int(uid) for uid in data if str(uid).isdigit()}
-                log.info("Loaded %d subscribers.", len(self.subscribers))
+                self.subscribers = set()
+                for uid in data:
+                    try:
+                        self.subscribers.add(int(uid))
+                    except (TypeError, ValueError):
+                        pass
+                log.info("Loaded %d entries from %s.", len(self.subscribers), self.path)
             except Exception as e:
-                log.warning("Could not read subscribers: %s", e)
+                log.warning("Could not read %s: %s", self.path, e)
 
     def add(self, uid: int) -> bool:
         if uid not in self.subscribers:
@@ -132,9 +147,18 @@ class SubscriberStore:
         try:
             self.path.write_text(json.dumps(list(self.subscribers), indent=2), encoding="utf-8")
         except Exception as e:
-            log.warning("Failed saving subscribers: %s", e)
+            log.warning("Failed saving %s: %s", self.path, e)
+
 
 subscribers = SubscriberStore(SUBSCRIBERS_FILE)
+
+channels = SubscriberStore(CHANNELS_FILE)
+# Render's disk is ephemeral, so channels can also be pinned via env:
+# CHANNEL_IDS="-1001234567890,-100987..."
+for _cid in os.environ.get("CHANNEL_IDS", "").split(","):
+    _cid = _cid.strip()
+    if _cid.lstrip("-").isdigit():
+        channels.subscribers.add(int(_cid))
 
 
 # =========================================================================== #
@@ -149,6 +173,7 @@ class ScrapedSchedule:
     html_hash: str
     active_slot: int = -1                   # 0..47
 
+
 class OblenergoScraper:
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
@@ -160,7 +185,7 @@ class OblenergoScraper:
             self._session = aiohttp.ClientSession(
                 headers=BROWSER_HEADERS,
                 cookies=BROWSER_COOKIES,
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=10),
             )
         return self._session
 
@@ -241,6 +266,7 @@ class OblenergoScraper:
             active_slot=active_slot,
         )
 
+
 scraper = OblenergoScraper()
 
 
@@ -259,6 +285,7 @@ def load_font(size: int, bold: bool = False):
             except Exception:
                 pass
     return ImageFont.load_default()
+
 
 def render_replica_table(sched: ScrapedSchedule) -> bytes:
     """
@@ -289,6 +316,7 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     font_grp_lbl = load_font(9, bold=False)
     font_grp_num = load_font(16, bold=True)
     font_cell = load_font(11, bold=True)
+    font_header_h = load_font(13, bold=True)
 
     # ======================================================================= #
     # 1. TOP NAVIGATION / HEADER BAR (y: 28 to 92)
@@ -298,7 +326,6 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     draw.text((141, 60), sched.date_str, font=font_date_big, fill=(255, 255, 255), anchor="mm")
 
     # Center-Left: Clock icon + Status text
-    # Draw simple vector clock icon
     clock_cx, clock_cy = 280, 60
     draw.ellipse([clock_cx - 11, clock_cy - 11, clock_cx + 11, clock_cy + 11], outline=COLOR_DARK_TEXT, width=2)
     draw.line([(clock_cx, clock_cy), (clock_cx, clock_cy - 6)], fill=COLOR_DARK_TEXT, width=2)
@@ -357,7 +384,10 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     # Top Hours Row Background
     draw.rectangle([left_col_x0, top_hour_y0, grid_x1, top_hour_y1], fill=COLOR_HOURS_BG)
     # Left Header Date above "ГРУПА"
-    draw.text((left_col_x0 + left_col_w // 2, (top_hour_y0 + top_hour_y1) // 2), sched.date_str, font=font_header_h, fill=COLOR_DARK_TEXT, anchor="mm")
+    draw.text(
+        (left_col_x0 + left_col_w // 2, (top_hour_y0 + top_hour_y1) // 2),
+        sched.date_str, font=font_header_h, fill=COLOR_DARK_TEXT, anchor="mm",
+    )
 
     # Top Hours: ONLY full hours (00:00 .. 23:00), NO :30 sub-labels
     for h in range(24):
@@ -434,6 +464,11 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
         is_persistent=True,
     )
 
+
+def refresh_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Оновити", callback_data="btn_refresh")]])
+
+
 def help_text() -> str:
     return (
         "💡 <b>Бот-реплікатор сайту Чернівціобленерго</b>\n\n"
@@ -443,8 +478,43 @@ def help_text() -> str:
         "• 📊 <b>Актуальний графік</b> — отримати поточну таблицю з сайту.\n"
         "• ⏱ <b>Статус сайту</b> — перевірити дату та час публікації.\n"
         "• 🔄 <b>Оновити</b> — примусово перевірити зміни прямо зараз.\n"
-        "• 🔔 Користувачі автоматично отримують сповіщення при кожній зміні графіка на сайті."
+        "• 🔔 Користувачі та канали автоматично отримують сповіщення при кожній зміні графіка на сайті."
     )
+
+
+def build_caption(sched: ScrapedSchedule, changed: bool = False) -> str:
+    head = (
+        "🔄 <b>Графік на сайті Обленерго змінився!</b>\n\n"
+        if changed
+        else "📊 <b>Графік відключень з сайту Обленерго</b>\n"
+    )
+    return f"{head}📅 Дата: <b>{sched.date_str}</b>\n⏱ Станом на: <b>{sched.upd_time}</b>"
+
+
+# =========================================================================== #
+# Broadcasting (users + channels)
+# =========================================================================== #
+async def broadcast(bot, sched: ScrapedSchedule, changed: bool = True) -> None:
+    png_bytes = render_replica_table(sched)
+    caption = build_caption(sched, changed)
+
+    targets = [(uid, subscribers) for uid in list(subscribers.subscribers)] + \
+              [(cid, channels) for cid in list(channels.subscribers)]
+
+    for chat_id, store in targets:
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=io.BytesIO(png_bytes),
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            )
+        except (Forbidden, BadRequest) as e:
+            log.warning("Removing %s: %s", chat_id, e)
+            store.remove(chat_id)
+        except Exception as e:
+            log.warning("Failed posting to %s: %s", chat_id, e)
+        await asyncio.sleep(0.05)
 
 
 # =========================================================================== #
@@ -462,8 +532,10 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=main_reply_keyboard())
     await send_schedule_replica(update, ctx)
 
+
 async def on_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(help_text(), parse_mode=ParseMode.HTML, reply_markup=main_reply_keyboard())
+
 
 async def send_schedule_replica(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -480,27 +552,22 @@ async def send_schedule_replica(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 
     if not sched:
         err_msg = scraper.last_fetch_error or "Сайт тимчасово недоступний"
-        await ctx.bot.send_message(chat_id, f"🔴 <b>Не вдалося завантажити графік з сайту</b>\n<i>{err_msg}</i>", parse_mode=ParseMode.HTML)
+        await ctx.bot.send_message(
+            chat_id,
+            f"🔴 <b>Не вдалося завантажити графік з сайту</b>\n<i>{err_msg}</i>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     png_bytes = render_replica_table(sched)
-    caption = (
-        f"📊 <b>Графік відключень з сайту Обленерго</b>\n"
-        f"📅 Дата: <b>{sched.date_str}</b>\n"
-        f"⏱ Станом на: <b>{sched.upd_time}</b>"
-    )
-
-    inline_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Оновити", callback_data="btn_refresh")
-    ]])
-
     await ctx.bot.send_photo(
         chat_id=chat_id,
         photo=io.BytesIO(png_bytes),
-        caption=caption,
+        caption=build_caption(sched),
         parse_mode=ParseMode.HTML,
-        reply_markup=inline_kb
+        reply_markup=refresh_inline_keyboard(),
     )
+
 
 async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sched = scraper.last_schedule
@@ -513,9 +580,11 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"• 📅 Дата в графіку: <b>{sched.date_str}</b>\n"
         f"• ⏱ Актуально станом на: <b>{sched.upd_time}</b>\n"
         f"• 👥 Підписників бота: <b>{len(subscribers.subscribers)}</b>\n"
+        f"• 📣 Каналів: <b>{len(channels.subscribers)}</b>\n"
         f"• 🔄 Період моніторингу: <b>кожні {CHECK_INTERVAL_SECONDS} сек.</b>"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
@@ -525,19 +594,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if sched:
             scraper.last_schedule = sched
             png_bytes = render_replica_table(sched)
-            caption = (
-                f"📊 <b>Графік відключень з сайту Обленерго</b>\n"
-                f"📅 Дата: <b>{sched.date_str}</b>\n"
-                f"⏱ Станом на: <b>{sched.upd_time}</b>"
-            )
             try:
                 await q.edit_message_media(
-                    media=io.BytesIO(png_bytes),
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
+                    media=InputMediaPhoto(
+                        io.BytesIO(png_bytes),
+                        caption=build_caption(sched),
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    reply_markup=refresh_inline_keyboard(),
                 )
+            except BadRequest as e:
+                # "message is not modified" -> nothing changed, that's fine
+                if "not modified" not in str(e).lower():
+                    await send_schedule_replica(update, ctx)
             except Exception:
                 await send_schedule_replica(update, ctx)
+
 
 async def on_text_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.effective_message.text or "").strip()
@@ -556,6 +628,36 @@ async def on_text_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("Скористайтесь кнопками меню 👇", reply_markup=main_reply_keyboard())
 
 
+async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fires when the bot's own status changes in a chat (e.g. made admin of a channel)."""
+    cm = update.my_chat_member
+    if not cm or cm.chat.type != "channel":
+        return
+
+    chat_id = cm.chat.id
+    status = cm.new_chat_member.status
+
+    if status == "administrator":
+        channels.add(chat_id)
+        log.info("Added to channel %s (%s)", chat_id, cm.chat.title)
+
+        sched = scraper.last_schedule or await scraper.fetch()
+        if sched:
+            scraper.last_schedule = sched
+            try:
+                await ctx.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=io.BytesIO(render_replica_table(sched)),
+                    caption=build_caption(sched),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                log.warning("Initial channel post failed: %s", e)
+    elif status in ("left", "kicked"):
+        channels.remove(chat_id)
+        log.info("Removed from channel %s", chat_id)
+
+
 # =========================================================================== #
 # Background Monitoring Job
 # =========================================================================== #
@@ -571,9 +673,9 @@ async def check_site_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     has_changed = (
-        new_sched.date_str != old_sched.date_str or
-        new_sched.upd_time != old_sched.upd_time or
-        new_sched.html_hash != old_sched.html_hash
+        new_sched.date_str != old_sched.date_str
+        or new_sched.upd_time != old_sched.upd_time
+        or new_sched.html_hash != old_sched.html_hash
     )
 
     if not has_changed:
@@ -582,27 +684,8 @@ async def check_site_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("🔔 Schedule updated on site! Date: %s, Upd: %s", new_sched.date_str, new_sched.upd_time)
     scraper.last_schedule = new_sched
 
-    png_bytes = render_replica_table(new_sched)
-    caption = (
-        f"🔄 <b>Графік на сайті Обленерго змінився!</b>\n\n"
-        f"📅 Дата: <b>{new_sched.date_str}</b>\n"
-        f"⏱ Станом на: <b>{new_sched.upd_time}</b>"
-    )
+    await broadcast(ctx.bot, new_sched, changed=True)
 
-    uids = list(subscribers.subscribers)
-    for uid in uids:
-        try:
-            await ctx.bot.send_photo(
-                chat_id=uid,
-                photo=io.BytesIO(png_bytes),
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-            )
-        except Forbidden:
-            subscribers.remove(uid)
-        except Exception as e:
-            log.warning("Failed alerting %s: %s", uid, e)
-        await asyncio.sleep(0.05)
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, Conflict):
@@ -627,6 +710,7 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("help", on_help))
     app.add_handler(CommandHandler("table", send_schedule_replica))
     app.add_handler(CommandHandler("status", on_status))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_menu))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(on_error)
@@ -636,14 +720,23 @@ def run_bot() -> None:
     else:
         log.warning("JobQueue not initialized. Ensure python-telegram-bot[job-queue] is installed.")
 
-    app.run_polling(drop_pending_updates=True, stop_signals=None)
+    app.run_polling(
+        drop_pending_updates=True,
+        stop_signals=None,
+        allowed_updates=["message", "callback_query", "my_chat_member"],
+    )
+
 
 def get_dashboard_data():
     sched = scraper.last_schedule
     date_val = sched.date_str if sched else "Немає даних"
     upd_val = sched.upd_time if sched else "Немає даних"
     sub_count = len(subscribers.subscribers)
-    status_str = f"Активний | Підписників: {sub_count} | Перевірка: кожні {CHECK_INTERVAL_SECONDS}с"
+    ch_count = len(channels.subscribers)
+    status_str = (
+        f"Активний | Підписників: {sub_count} | Каналів: {ch_count} | "
+        f"Перевірка: кожні {CHECK_INTERVAL_SECONDS}с"
+    )
 
     img_preview = None
     if sched:
@@ -651,9 +744,10 @@ def get_dashboard_data():
             raw_png = render_replica_table(sched)
             img_preview = Image.open(io.BytesIO(raw_png))
         except Exception:
-            pass
+            log.exception("Dashboard render failed")
 
     return status_str, date_val, upd_val, img_preview
+
 
 with gr.Blocks(title="Oblenergo Replica Bot Dashboard") as demo:
     gr.Markdown("# ⚡ Чернівціобленерго — Бот-реплікатор сайту")
@@ -669,6 +763,7 @@ with gr.Blocks(title="Oblenergo Replica Bot Dashboard") as demo:
     btn_refresh.click(fn=get_dashboard_data, outputs=[box_status, box_date, box_upd, image_output])
 
     demo.load(fn=get_dashboard_data, outputs=[box_status, box_date, box_upd, image_output])
+
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_bot, daemon=True)
