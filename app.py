@@ -89,7 +89,6 @@ BROWSER_COOKIES = {
 }
 
 # Visual Colors (Exact match to Screenshot 2)
-COLOR_BG = (235, 238, 242)          # Page background
 COLOR_CARD_BG = (255, 255, 255)     # Inner card
 COLOR_BLUE_BADGE = (101, 140, 226)  # Date badge (#658CE2)
 COLOR_GREEN_BANNER = (116, 140, 66) # Olive banner (#748C42)
@@ -100,7 +99,8 @@ COLOR_MAYBE = (122, 168, 198)       # Maybe powered - steel blue (#7AA8C6)
 COLOR_BORDER = (255, 255, 255)      # White separators
 COLOR_DARK_TEXT = (33, 37, 41)
 COLOR_MUTED_GRAY = (120, 144, 156)  # Blue-gray for "Г Р У П А"
-COLOR_LINE_MARKER = (25, 118, 210)  # Blue time indicator line
+COLOR_LINE_MARKER = (220, 30, 30)   # Red time indicator line
+LINE_MARKER_ALPHA = 77              # 70% transparent (~30% opaque)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 # httpx logs full Telegram URLs (which contain the bot token) at INFO level
@@ -520,7 +520,7 @@ LOGO_C4_B64 = (
 )
 
 WATERMARK_TEXT = "Чернівці | С4"
-WATERMARK_ALPHA = 22  # 0..255, very transparent
+WATERMARK_ALPHA = 48  # 0..255, very transparent
 
 _logo_cache: dict[int, Image.Image] = {}
 
@@ -571,14 +571,11 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     - Authentic blue date badge, olive banner, and group formatting
     """
     width = 1440
-    height = 700
+    height = 660
 
-    # Background card canvas
-    im = Image.new("RGB", (width, height), COLOR_BG)
+    # Plain white background (no outer canvas / rounded card)
+    im = Image.new("RGB", (width, height), COLOR_CARD_BG)
     draw = ImageDraw.Draw(im)
-
-    # Rounded white main container
-    draw.rounded_rectangle([16, 16, width - 16, height - 16], radius=14, fill=COLOR_CARD_BG)
 
     # Fonts
     font_date_big = load_font(28, bold=True)
@@ -726,11 +723,17 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     draw = ImageDraw.Draw(im)
 
     # ======================================================================= #
-    # 6. CURRENT-TIME VERTICAL BLUE LINE
+    # 6. CURRENT-TIME LINE (red, 70% transparent, table rows only - not on hour bars)
     # ======================================================================= #
     if 0 <= sched.active_slot < 48:
         mark_x = int(grid_x0 + sched.active_slot * slot_w + slot_w // 2)
-        draw.line([(mark_x, top_hour_y0), (mark_x, bot_hour_y1)], fill=COLOR_LINE_MARKER, width=2)
+        line_layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
+        ImageDraw.Draw(line_layer).line(
+            [(mark_x, grid_y0), (mark_x, grid_y1)],
+            fill=COLOR_LINE_MARKER + (LINE_MARKER_ALPHA,),
+            width=3,
+        )
+        im = Image.alpha_composite(im.convert("RGBA"), line_layer).convert("RGB")
 
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=True)
