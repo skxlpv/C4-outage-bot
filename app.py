@@ -206,9 +206,13 @@ class OblenergoScraper:
             log.warning("Scrape error: %s", e)
             return None
 
-        return self.parse_html(html_text)
+        return self.parse_html(html_text, prev_schedule=self.last_schedule)
 
-    def parse_html(self, html_text: str) -> Optional[ScrapedSchedule]:
+    def parse_html(
+        self,
+        html_text: str,
+        prev_schedule: Optional[ScrapedSchedule] = None,
+    ) -> Optional[ScrapedSchedule]:
         soup = BeautifulSoup(html_text, "html.parser")
         gsv = soup.select_one("#gsv")
         if not gsv:
@@ -248,10 +252,26 @@ class OblenergoScraper:
                 else:
                     q_slots.append("з")
 
+            # As the day progresses, the site removes elapsed 30-min cells.
+            # Preserve earlier slots from prev_schedule (same date) so half-hour
+            # roll-offs do not alter historical slots or trigger false updates.
             if len(q_slots) < 48:
                 start_offset = 48 - len(q_slots)
-                q_slots = ["з"] * start_offset + q_slots
+                if (
+                    prev_schedule is not None
+                    and prev_schedule.date_str == date_str
+                    and q in prev_schedule.slots
+                ):
+                    prefix = list(prev_schedule.slots[q][:start_offset])
+                    if len(prefix) < start_offset:
+                        prefix.extend(["з"] * (start_offset - len(prefix)))
+                else:
+                    prefix = ["з"] * start_offset
+                q_slots = prefix + q_slots
             group_slots[q] = q_slots[:48]
+
+        if not group_slots:
+            return None
 
         now = datetime.now(TZ)
         active_slot = now.hour * 2 + (1 if now.minute >= 30 else 0)
@@ -528,6 +548,8 @@ _logo_cache: dict[int, Image.Image] = {}
 def get_logo(diameter: int) -> Optional[Image.Image]:
     if diameter in _logo_cache:
         return _logo_cache[diameter]
+    if not LOGO_C4_B64:
+        return None
     try:
         raw = Image.open(io.BytesIO(base64.b64decode(LOGO_C4_B64))).convert("RGBA")
         _logo_cache[diameter] = raw.resize((diameter, diameter), Image.LANCZOS)
@@ -971,6 +993,7 @@ async def check_site_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     if not has_changed:
+        old_sched.active_slot = new_sched.active_slot
         return
 
     log.info("🔔 Schedule updated on site! Date: %s, Upd: %s", new_sched.date_str, new_sched.upd_time)
