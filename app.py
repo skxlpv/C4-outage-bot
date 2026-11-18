@@ -1,12 +1,12 @@
 """
-Chernivtsioblenergo Web Replica & Tracker Telegram Bot (HF Space Edition)
+Chernivtsioblenergo Web Replica & Tracker Telegram Bot (Render / HF Edition)
 
-Tracks https://oblenergo.cv.ua/shutdowns/ by monitoring:
-- Schedule Date (<div id="gsv_t">)
-- Update Timestamp "Станом на" (<div id="gsv_a">)
-- Grid State for Groups 1..12 across 48 half-hour slots
-
-Renders an authentic, identical image replica of their website table and sends it to Telegram.
+Replicates the exact layout of photo_2026-11-18_14-21-44:
+- Top bar with large blue date badge, status, legend, and logo
+- Olive green banner
+- Group rows: "Г Р У П А" + bold number
+- 00:00 to 23:00 hour markers (no :30 sub-labels)
+- Zero footer texts
 """
 from __future__ import annotations
 
@@ -18,11 +18,10 @@ import logging
 import os
 import re
 import threading
-import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -38,7 +37,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, Conflict, Forbidden
+from telegram.error import Conflict, Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -54,14 +53,12 @@ load_dotenv()
 # Configuration & Constants
 # =========================================================================== #
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-HF_TOKEN = os.environ.get("HF_TOKEN")
-DATASET_REPO = os.environ.get("DATASET_REPO", "")
 SUBSCRIBERS_FILE = Path(os.environ.get("SUBSCRIBERS_FILE", "subscribers.json"))
 OBLENERGO_URL = os.environ.get("OBLENERGO_URL", "https://oblenergo.cv.ua/shutdowns/")
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL", "30"))
 TZ = ZoneInfo("Europe/Kyiv")
 
-# Scraper Headers from user's cURL
+# Scraper Headers from cURL
 BROWSER_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "accept-language": "uk,en;q=0.9,en-GB;q=0.8,en-US;q=0.7,uk-UA;q=0.6",
@@ -83,15 +80,19 @@ BROWSER_COOKIES = {
     "hlgrp": "0",
 }
 
-# Website Color Palette (Matching their CSS)
-COLOR_ON = (199, 211, 159)      # #C7D39F - Заживлені (Light Green)
-COLOR_OFF = (229, 115, 115)     # #E57373 - Відключені (Warm Coral/Red)
-COLOR_MAYBE = (144, 164, 174)   # #90A4AE - Можливо заживлені (Slate Gray)
-COLOR_HEADER_BG = (67, 96, 45)  # #43602D - Olive Green Top Bar
-COLOR_HOURS_BG = (248, 224, 208)# #F8E0D0 - Peach Hour Header Bar
-COLOR_BORDER = (255, 255, 255)  # #FFFFFF - Cell Separator Lines
-COLOR_DARK_TEXT = (43, 44, 48)  # Charcoal
-COLOR_MUTED_TEXT = (100, 105, 115)
+# Visual Colors (Exact match to Screenshot 2)
+COLOR_BG = (235, 238, 242)          # Page background
+COLOR_CARD_BG = (255, 255, 255)     # Inner card
+COLOR_BLUE_BADGE = (21, 101, 192)   # Deep Royal Blue for Date (#1565C0)
+COLOR_GREEN_BANNER = (126, 157, 98) # Olive-Moss Green (#7E9D62)
+COLOR_HOURS_BG = (252, 228, 214)    # Peach (#FCE4D6)
+COLOR_ON = (199, 211, 159)          # Light Sage Green (#C7D39F)
+COLOR_OFF = (239, 154, 154)         # Soft Coral Red (#EF9A9A)
+COLOR_MAYBE = (176, 190, 197)       # Soft Slate Gray (#B0BEC5)
+COLOR_BORDER = (255, 255, 255)      # White separators
+COLOR_DARK_TEXT = (33, 37, 41)
+COLOR_MUTED_GRAY = (120, 144, 156)  # Blue-gray for "Г Р У П А"
+COLOR_LINE_MARKER = (25, 118, 210)  # Blue time indicator line
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("svitlo-replica-bot")
@@ -142,12 +143,11 @@ subscribers = SubscriberStore(SUBSCRIBERS_FILE)
 @dataclass
 class ScrapedSchedule:
     date_str: str                           # e.g. "18.11.2026"
-    upd_time: str                           # e.g. "13:30"
-    opened_time: str                        # e.g. "13:42"
+    upd_time: str                           # e.g. "07:51"
     month_name: str                         # e.g. "Листопад"
-    slots: dict[int, list[str]]             # group_id (1..12) -> list of 48 tokens ("з", "в", "мз")
+    slots: dict[int, list[str]]             # group_id (1..12) -> 48 slots ("з", "в", "мз")
     html_hash: str
-    active_slot: int = -1                   # current time slot index (0..47)
+    active_slot: int = -1                   # 0..47
 
 class OblenergoScraper:
     def __init__(self) -> None:
@@ -195,26 +195,17 @@ class OblenergoScraper:
         upd_el = soup.select_one("#gsv_a b")
         upd_time = upd_el.get_text().strip() if upd_el else "--:--"
 
-        # 3. Page open timestamp
-        actual_el = soup.select_one("#gsv_actual")
-        actual_txt = actual_el.get_text() if actual_el else ""
-        m_act = re.search(r"(\d{1,2}:\d{2})", actual_txt)
-        opened_time = m_act.group(1) if m_act else ""
-
-        # 4. Month header
+        # 3. Month header
         month_el = soup.select_one("#gsv_h p")
-        month_name = month_el.get_text().strip() if month_el else "Графік відключень"
+        month_name = month_el.get_text().strip() if month_el else "Листопад"
 
-        # 5. Extract slots for all 12 groups
-        # In HTML: <div id="inf{q}" data-id="{q}"> with children <u>, <o>, <s>
+        # 4. Extract slots for all 12 groups
         group_slots: dict[int, list[str]] = {}
-
         for q in range(1, 13):
             div = soup.select_one(f"#inf{q}") or soup.select_one(f'div[data-id="{q}"]')
             if not div:
                 continue
 
-            # Child elements in exact sequential order
             cells = div.find_all(recursive=False)
             q_slots: list[str] = []
 
@@ -230,25 +221,20 @@ class OblenergoScraper:
                 else:
                     q_slots.append("з")
 
-            # Pad or trim to exactly 48 slots
             if len(q_slots) < 48:
-                # If page opened midday and earlier slots were truncated
                 start_offset = 48 - len(q_slots)
                 q_slots = ["з"] * start_offset + q_slots
             group_slots[q] = q_slots[:48]
 
-        # Calculate active current slot
         now = datetime.now(TZ)
         active_slot = now.hour * 2 + (1 if now.minute >= 30 else 0)
 
-        # Hash of data to detect genuine state changes
         content_repr = f"{date_str}_{upd_time}_{json.dumps(group_slots, sort_keys=True)}"
         content_hash = hashlib.md5(content_repr.encode()).hexdigest()
 
         return ScrapedSchedule(
             date_str=date_str,
             upd_time=upd_time,
-            opened_time=opened_time,
             month_name=month_name,
             slots=group_slots,
             html_hash=content_hash,
@@ -259,7 +245,7 @@ scraper = OblenergoScraper()
 
 
 # =========================================================================== #
-# Replica Image Generator (Pillow)
+# Replica Image Generator (Pillow) - Replicating Screenshot #2
 # =========================================================================== #
 def load_font(size: int, bold: bool = False):
     candidates = [
@@ -276,91 +262,126 @@ def load_font(size: int, bold: bool = False):
 
 def render_replica_table(sched: ScrapedSchedule) -> bytes:
     """
-    Renders an authentic, visually identical replica of the Oblenergo HTML grid.
+    Renders the exact replica from screenshot #2:
+    - No :30 sub-labels on hour bars
+    - No footer text
+    - Legend repositioned in top bar with zero text drop-out
+    - Authentic blue date badge, olive banner, and group formatting
     """
-    width = 1260
-    height = 570
-    im = Image.new("RGB", (width, height), (255, 255, 255))
+    width = 1440
+    height = 700
+
+    # Background card canvas
+    im = Image.new("RGB", (width, height), COLOR_BG)
     draw = ImageDraw.Draw(im)
 
-    font_banner = load_font(18, bold=True)
-    font_sub = load_font(13, bold=False)
-    font_bold = load_font(13, bold=True)
-    font_header_h = load_font(10, bold=True)
-    font_header_sub = load_font(8, bold=False)
+    # Rounded white main container
+    draw.rounded_rectangle([16, 16, width - 16, height - 16], radius=14, fill=COLOR_CARD_BG)
+
+    # Fonts
+    font_date_big = load_font(28, bold=True)
+    font_status_txt = load_font(15, bold=True)
+    font_legend_box = load_font(12, bold=True)
+    font_legend_lbl = load_font(13, bold=False)
+    font_logo_txt = load_font(20, bold=True)
+    font_banner_txt = load_font(19, bold=True)
+    font_hour_h = load_font(12, bold=True)
+    font_grp_lbl = load_font(9, bold=False)
+    font_grp_num = load_font(16, bold=True)
     font_cell = load_font(11, bold=True)
-    font_grp = load_font(12, bold=True)
 
-    # 1. Top Green Banner (#43602D)
-    draw.rectangle([0, 0, width, 48], fill=COLOR_HEADER_BG)
-    draw.text((20, 24), sched.month_name.upper(), font=font_banner, fill=(255, 255, 255), anchor="lm")
-    draw.text((width - 20, 24), "ГРАФІК ПОГОДИННИХ ВІДКЛЮЧЕНЬ", font=font_banner, fill=(255, 255, 255), anchor="rm")
+    # ======================================================================= #
+    # 1. TOP NAVIGATION / HEADER BAR (y: 28 to 92)
+    # ======================================================================= #
+    # Left: Big Royal Blue Date Badge
+    draw.rounded_rectangle([32, 28, 250, 92], radius=12, fill=COLOR_BLUE_BADGE)
+    draw.text((141, 60), sched.date_str, font=font_date_big, fill=(255, 255, 255), anchor="mm")
 
-    # 2. Date Badge & "Станом на" Sub-Banner
-    draw.rectangle([0, 48, width, 92], fill=(245, 247, 250))
-    # Date chip
-    draw.rounded_rectangle([20, 56, 140, 84], radius=4, fill=(255, 255, 255), outline=(200, 205, 215), width=1)
-    draw.text((80, 70), sched.date_str, font=font_bold, fill=COLOR_DARK_TEXT, anchor="mm")
+    # Center-Left: Clock icon + Status text
+    # Draw simple vector clock icon
+    clock_cx, clock_cy = 280, 60
+    draw.ellipse([clock_cx - 11, clock_cy - 11, clock_cx + 11, clock_cy + 11], outline=COLOR_DARK_TEXT, width=2)
+    draw.line([(clock_cx, clock_cy), (clock_cx, clock_cy - 6)], fill=COLOR_DARK_TEXT, width=2)
+    draw.line([(clock_cx, clock_cy), (clock_cx + 5, clock_cy)], fill=COLOR_DARK_TEXT, width=2)
 
-    # Updated timestamp
-    upd_text = f"Графік актуальний станом на {sched.upd_time}"
-    draw.text((155, 70), upd_text, font=font_bold, fill=COLOR_DARK_TEXT, anchor="lm")
+    status_str = f"Графік актуальний станом на {sched.upd_time}"
+    draw.text((302, 60), status_str, font=font_status_txt, fill=COLOR_DARK_TEXT, anchor="lm")
 
-    # 3. Legend (В, З, МЗ)
-    leg_x = width - 420
-    draw.text((leg_x, 70), "Умовна позначка:", font=font_sub, fill=COLOR_MUTED_TEXT, anchor="lm")
-
+    # Center-Right: Legend (Repositioned to ensure zero text drop-out)
+    leg_start_x = 680
     badges = [
-        ("В", "Відключені", COLOR_OFF),
-        ("З", "Заживлені", COLOR_ON),
-        ("МЗ", "Можливо заживлені", COLOR_MAYBE),
+        ("В", "Відключені", COLOR_OFF, 30),
+        ("З", "Заживлені", COLOR_ON, 30),
+        ("МЗ", "Можливо заживлені", COLOR_MAYBE, 38),
     ]
-    cur_bx = leg_x + 125
-    for tag, label, color in badges:
-        bw = 28 if len(tag) > 1 else 20
-        draw.rectangle([cur_bx, 60, cur_bx + bw, 80], fill=color)
-        draw.text((cur_bx + bw // 2, 70), tag, font=font_cell, fill=COLOR_DARK_TEXT, anchor="mm")
-        cur_bx += bw + 6
-        draw.text((cur_bx, 70), label, font=font_sub, fill=COLOR_DARK_TEXT, anchor="lm")
-        cur_bx += int(len(label) * 7.5) + 14
 
-    # 4. Table Grid Geometry
-    left_col_w = 96
-    grid_x0 = left_col_w
-    grid_x1 = width - 14
+    bx = leg_start_x
+    for tag, label, color, box_w in badges:
+        draw.rounded_rectangle([bx, 45, bx + box_w, 75], radius=4, fill=color)
+        draw.text((bx + box_w // 2, 60), tag, font=font_legend_box, fill=COLOR_DARK_TEXT, anchor="mm")
+        bx += box_w + 8
+        draw.text((bx, 60), label, font=font_legend_lbl, fill=COLOR_DARK_TEXT, anchor="lm")
+        bx += int(len(label) * 8.0) + 18
+
+    # Far-Right: Circular Blue Brand Badge (Х·Ч / C4)
+    logo_cx, logo_cy = width - 68, 60
+    draw.ellipse([logo_cx - 28, logo_cy - 28, logo_cx + 28, logo_cy + 28], fill=COLOR_BLUE_BADGE)
+    draw.text((logo_cx, logo_cy), "Х·Ч", font=font_logo_txt, fill=(255, 255, 255), anchor="mm")
+
+    # ======================================================================= #
+    # 2. GREEN BANNER (y: 108 to 152)
+    # ======================================================================= #
+    draw.rounded_rectangle([32, 108, width - 32, 152], radius=8, fill=COLOR_GREEN_BANNER)
+    draw.text((52, 130), sched.month_name.capitalize(), font=font_banner_txt, fill=COLOR_DARK_TEXT, anchor="lm")
+    draw.text((width // 2 + 50, 130), "Графік погодинних відключень", font=font_banner_txt, fill=COLOR_DARK_TEXT, anchor="mm")
+
+    # ======================================================================= #
+    # 3. TABLE GRID GEOMETRY
+    # ======================================================================= #
+    left_col_x0 = 32
+    left_col_w = 120
+    grid_x0 = left_col_x0 + left_col_w
+    grid_x1 = width - 32
     grid_w = grid_x1 - grid_x0
     slot_w = grid_w / 48
+    hour_w = slot_w * 2
 
-    hours_h = 32
-    row_h = 28
-    grid_y0 = 96 + hours_h
+    top_hour_y0 = 162
+    top_hour_y1 = 196
+    row_h = 33
+    grid_y0 = top_hour_y1
+    grid_y1 = grid_y0 + 12 * row_h
+    bot_hour_y0 = grid_y1
+    bot_hour_y1 = bot_hour_y0 + 34
 
-    # Top Hours Header Background
-    draw.rectangle([0, 96, width, grid_y0], fill=COLOR_HOURS_BG)
-    draw.rectangle([0, 96, left_col_w, grid_y0], fill=(235, 210, 195))
-    draw.text((left_col_w // 2, 96 + hours_h // 2), "ГРУПА", font=font_bold, fill=COLOR_DARK_TEXT, anchor="mm")
+    # Top Hours Row Background
+    draw.rectangle([left_col_x0, top_hour_y0, grid_x1, top_hour_y1], fill=COLOR_HOURS_BG)
+    # Left Header Date above "ГРУПА"
+    draw.text((left_col_x0 + left_col_w // 2, (top_hour_y0 + top_hour_y1) // 2), sched.date_str, font=font_header_h, fill=COLOR_DARK_TEXT, anchor="mm")
 
-    # Draw Hour Markers 00..23
+    # Top Hours: ONLY full hours (00:00 .. 23:00), NO :30 sub-labels
     for h in range(24):
-        hx = grid_x0 + h * (slot_w * 2)
-        # Hour divider
-        draw.line([(hx, 96), (hx, grid_y0)], fill=COLOR_BORDER, width=1)
-        # Hour text
-        draw.text((hx + slot_w, 104), f"{h:02d}:00", font=font_header_h, fill=COLOR_DARK_TEXT, anchor="mm")
-        draw.text((hx + slot_w * 1.5, 118), f"{h:02d}:30", font=font_header_sub, fill=COLOR_MUTED_TEXT, anchor="mm")
+        hx = grid_x0 + h * hour_w
+        draw.line([(hx, top_hour_y0), (hx, top_hour_y1)], fill=COLOR_BORDER, width=1)
+        draw.text((hx + hour_w / 2, (top_hour_y0 + top_hour_y1) // 2), f"{h:02d}:00", font=font_hour_h, fill=COLOR_DARK_TEXT, anchor="mm")
 
-    # 5. Render 12 Group Rows
+    # ======================================================================= #
+    # 4. RENDER 12 GROUP ROWS
+    # ======================================================================= #
     for q in range(1, 13):
         ry0 = grid_y0 + (q - 1) * row_h
         ry1 = ry0 + row_h
 
-        # Group Label on Left
+        # Left Column: "Г Р У П А" + bold group number
         bg_grp = (255, 255, 255) if q % 2 != 0 else (248, 250, 252)
-        draw.rectangle([0, ry0, left_col_w, ry1], fill=bg_grp)
-        draw.line([(0, ry1), (width, ry1)], fill=COLOR_BORDER, width=1)
-        draw.text((left_col_w // 2, (ry0 + ry1) // 2), f"Група {q}", font=font_grp, fill=COLOR_DARK_TEXT, anchor="mm")
+        draw.rectangle([left_col_x0, ry0, grid_x0, ry1], fill=bg_grp)
+        draw.line([(left_col_x0, ry1), (grid_x1, ry1)], fill=COLOR_BORDER, width=1)
 
-        # 48 Slots
+        # Spaced out "Г Р У П А" on left, large number on right
+        draw.text((left_col_x0 + 12, (ry0 + ry1) // 2), "Г Р У П А", font=font_grp_lbl, fill=COLOR_MUTED_GRAY, anchor="lm")
+        draw.text((grid_x0 - 18, (ry0 + ry1) // 2), str(q), font=font_grp_num, fill=COLOR_DARK_TEXT, anchor="rm")
+
+        # 48 Grid Cells
         q_slots = sched.slots.get(q, ["з"] * 48)
         for s in range(48):
             sx0 = int(grid_x0 + s * slot_w)
@@ -374,30 +395,26 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
             else:
                 fill_c = COLOR_ON
 
-            # Cell rectangle with white borders
+            # Cell with clean 1px white borders
             draw.rectangle([sx0, ry0, sx1, ry1], fill=fill_c, outline=COLOR_BORDER, width=1)
             # Centered text abbreviation
             draw.text(((sx0 + sx1) // 2, (ry0 + ry1) // 2), state, font=font_cell, fill=COLOR_DARK_TEXT, anchor="mm")
 
-    # 6. Bottom Hours Bar (Repeat for easy reading)
-    bot_y0 = grid_y0 + 12 * row_h
-    bot_y1 = bot_y0 + 26
-    draw.rectangle([0, bot_y0, width, bot_y1], fill=COLOR_HOURS_BG)
+    # ======================================================================= #
+    # 5. BOTTOM HOURS ROW (No :30 sub-labels)
+    # ======================================================================= #
+    draw.rectangle([left_col_x0, bot_hour_y0, grid_x1, bot_hour_y1], fill=COLOR_HOURS_BG)
     for h in range(24):
-        hx = grid_x0 + h * (slot_w * 2)
-        draw.line([(hx, bot_y0), (hx, bot_y1)], fill=COLOR_BORDER, width=1)
-        draw.text((hx + slot_w, bot_y0 + 13), f"{h:02d}:00", font=font_header_h, fill=COLOR_DARK_TEXT, anchor="mm")
+        hx = grid_x0 + h * hour_w
+        draw.line([(hx, bot_hour_y0), (hx, bot_hour_y1)], fill=COLOR_BORDER, width=1)
+        draw.text((hx + hour_w / 2, (bot_hour_y0 + bot_hour_y1) // 2), f"{h:02d}:00", font=font_hour_h, fill=COLOR_DARK_TEXT, anchor="mm")
 
-    # 7. Current Time Red Indicator Line
+    # ======================================================================= #
+    # 6. CURRENT-TIME VERTICAL BLUE LINE
+    # ======================================================================= #
     if 0 <= sched.active_slot < 48:
         mark_x = int(grid_x0 + sched.active_slot * slot_w + slot_w // 2)
-        draw.line([(mark_x, 96), (mark_x, bot_y1)], fill=(211, 47, 47), width=3)
-
-    # 8. Footer Info
-    footer_y = bot_y1 + 4
-    draw.text((20, footer_y + 10), "Офіційне джерело: АТ «Чернівціобленерго» (oblenergo.cv.ua)", font=font_sub, fill=COLOR_MUTED_TEXT, anchor="lm")
-    if sched.opened_time:
-        draw.text((width - 20, footer_y + 10), f"Зріз сторінки: {sched.opened_time}", font=font_sub, fill=COLOR_MUTED_TEXT, anchor="rm")
+        draw.line([(mark_x, top_hour_y0), (mark_x, bot_hour_y1)], fill=COLOR_LINE_MARKER, width=2)
 
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=True)
@@ -419,14 +436,14 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
 
 def help_text() -> str:
     return (
-        "💡 <b>Бот моніторингу графіків Чернівціобленерго</b>\n\n"
-        "Бот підключається напряму до сайту <code>oblenergo.cv.ua/shutdowns/</code>, "
-        "відстежує дату та рядок <b>«Станом на»</b>, і генерує точну копію офіційної таблиці відключень.\n\n"
+        "💡 <b>Бот-реплікатор сайту Чернівціобленерго</b>\n\n"
+        "Бот підключається напряму до <code>oblenergo.cv.ua/shutdowns/</code>, "
+        "відстежує дату та рядок <b>«Станом на»</b>, і генерує візуально ідентичну копію таблиці.\n\n"
         "<b>Команди:</b>\n"
-        "• 📊 <b>Актуальний графік</b> — отримати поточну копію таблиці з сайту.\n"
+        "• 📊 <b>Актуальний графік</b> — отримати поточну таблицю з сайту.\n"
         "• ⏱ <b>Статус сайту</b> — перевірити дату та час публікації.\n"
         "• 🔄 <b>Оновити</b> — примусово перевірити зміни прямо зараз.\n"
-        "• 🔔 Всі користувачі, які натиснули /start, автоматично отримують сповіщення при будь-якій зміні графіка."
+        "• 🔔 Користувачі автоматично отримують сповіщення при кожній зміні графіка на сайті."
     )
 
 
@@ -435,15 +452,14 @@ def help_text() -> str:
 # =========================================================================== #
 async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    is_new = subscribers.add(uid)
+    subscribers.add(uid)
 
     msg = (
         "👋 <b>Вітаємо!</b>\n\n"
-        "Ви успішно підписалися на сповіщення про зміни графіка з сайту <b>Чернівціобленерго</b>.\n"
-        "Щойно обленерго оновить статус або змінить години відключень, бот надішле вам точну копію таблиці."
+        "Ви успішно підписалися на сповіщення про графіки з сайту <b>Чернівціобленерго</b>.\n"
+        "Щойно обленерго оновить статус або змінить години відключень, бот надішле вам оновлену таблицю."
     )
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=main_reply_keyboard())
-    # Send current table right away
     await send_schedule_replica(update, ctx)
 
 async def on_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -489,14 +505,13 @@ async def send_schedule_replica(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
 async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sched = scraper.last_schedule
     if not sched:
-        await update.effective_message.reply_text("⏳ Дані ще завантажуються, спробуйте через декілька секунд.")
+        await update.effective_message.reply_text("⏳ Дані ще завантажуються, спробуйте через кілька секунд.")
         return
 
     text = (
         f"🌐 <b>Статус сайту Чернівціобленерго:</b>\n\n"
         f"• 📅 Дата в графіку: <b>{sched.date_str}</b>\n"
         f"• ⏱ Актуально станом на: <b>{sched.upd_time}</b>\n"
-        f"• 🕒 Зріз даних: <b>{sched.opened_time or 'нещодавно'}</b>\n"
         f"• 👥 Підписників бота: <b>{len(subscribers.subscribers)}</b>\n"
         f"• 🔄 Період моніторингу: <b>кожні {CHECK_INTERVAL_SECONDS} сек.</b>"
     )
@@ -545,20 +560,16 @@ async def on_text_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # Background Monitoring Job
 # =========================================================================== #
 async def check_site_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Runs every CHECK_INTERVAL_SECONDS. Detects changes in date, timestamp, or grid."""
     new_sched = await scraper.fetch()
     if not new_sched:
         return
 
     old_sched = scraper.last_schedule
-
-    # First run: initialize without broadcasting
     if old_sched is None:
         scraper.last_schedule = new_sched
         log.info("Initialized scraper: date=%s, upd=%s", new_sched.date_str, new_sched.upd_time)
         return
 
-    # Change detection: date changed, 'Станом на' timestamp changed, or cell contents changed
     has_changed = (
         new_sched.date_str != old_sched.date_str or
         new_sched.upd_time != old_sched.upd_time or
@@ -571,7 +582,6 @@ async def check_site_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("🔔 Schedule updated on site! Date: %s, Upd: %s", new_sched.date_str, new_sched.upd_time)
     scraper.last_schedule = new_sched
 
-    # Render image once
     png_bytes = render_replica_table(new_sched)
     caption = (
         f"🔄 <b>Графік на сайті Обленерго змінився!</b>\n\n"
@@ -579,7 +589,6 @@ async def check_site_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏱ Станом на: <b>{new_sched.upd_time}</b>"
     )
 
-    # Broadcast to all registered subscribers
     uids = list(subscribers.subscribers)
     for uid in uids:
         try:
@@ -590,7 +599,6 @@ async def check_site_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode=ParseMode.HTML,
             )
         except Forbidden:
-            # User blocked the bot
             subscribers.remove(uid)
         except Exception as e:
             log.warning("Failed alerting %s: %s", uid, e)
@@ -604,11 +612,11 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================================================================== #
-# Bot Thread & Gradio App (HF Space Entrypoint)
+# Bot Thread & Gradio App (Render / HF Entrypoint)
 # =========================================================================== #
 def run_bot() -> None:
     if not BOT_TOKEN:
-        log.error("BOT_TOKEN is missing! Set it in Space Secrets.")
+        log.error("BOT_TOKEN is missing! Set it in Environment Variables.")
         return
 
     loop = asyncio.new_event_loop()
@@ -623,8 +631,11 @@ def run_bot() -> None:
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(on_error)
 
-    # Repeating job queue
-    app.job_queue.run_repeating(check_site_job, interval=CHECK_INTERVAL_SECONDS, first=5)
+    if app.job_queue:
+        app.job_queue.run_repeating(check_site_job, interval=CHECK_INTERVAL_SECONDS, first=5)
+    else:
+        log.warning("JobQueue not initialized. Ensure python-telegram-bot[job-queue] is installed.")
+
     app.run_polling(drop_pending_updates=True, stop_signals=None)
 
 def get_dashboard_data():
@@ -662,4 +673,5 @@ with gr.Blocks(title="Oblenergo Replica Bot Dashboard") as demo:
 if __name__ == "__main__":
     t = threading.Thread(target=run_bot, daemon=True)
     t.start()
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    port = int(os.environ.get("PORT", 7860))
+    demo.launch(server_name="0.0.0.0", server_port=port)
