@@ -90,7 +90,7 @@ BROWSER_COOKIES = {
 
 # Visual Colors (Exact match to Screenshot 2)
 COLOR_CARD_BG = (255, 255, 255)     # Inner card
-COLOR_BLUE_BADGE = (101, 140, 226)  # Date badge (#658CE2)
+COLOR_DATE_BADGE = (240, 236, 225)  # Date badge - milky cream (#F0ECE1)
 COLOR_GREEN_BANNER = (116, 140, 66) # Olive banner (#748C42)
 COLOR_HOURS_BG = (245, 203, 166)    # Peach / skin hours bar (#F5CBA6)
 COLOR_ON = (172, 196, 116)          # Powered - rich sage green (#ACC474)
@@ -537,14 +537,14 @@ def get_logo(diameter: int) -> Optional[Image.Image]:
         return None
 
 
-def apply_watermark(base: Image.Image, text: str, alpha: int) -> Image.Image:
-    """Overlay a large, slightly rotated, semi-transparent text in the middle of the image."""
+def apply_watermark(base: Image.Image, text: str, alpha: int, center_y: Optional[int] = None) -> Image.Image:
+    """Overlay a large, horizontal, semi-transparent text centered on the image."""
     w, h = base.size
     layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     ld = ImageDraw.Draw(layer)
     wm_font = load_font(96, bold=True)
-    ld.text((w // 2, h // 2 + 30), text, font=wm_font, fill=(33, 37, 41, alpha), anchor="mm")
-    layer = layer.rotate(8, resample=Image.BICUBIC, center=(w // 2, h // 2))
+    cy = center_y if center_y is not None else h // 2
+    ld.text((w // 2, cy), text, font=wm_font, fill=(33, 37, 41, alpha), anchor="mm")
     return Image.alpha_composite(base.convert("RGBA"), layer).convert("RGB")
 
 
@@ -593,44 +593,47 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     # ======================================================================= #
     # 1. TOP NAVIGATION / HEADER BAR (y: 28 to 92)
     # ======================================================================= #
-    # Left: Big Royal Blue Date Badge
-    draw.rounded_rectangle([32, 28, 250, 92], radius=12, fill=COLOR_BLUE_BADGE)
-    draw.text((141, 60), sched.date_str, font=font_date_big, fill=(255, 255, 255), anchor="mm")
-
-    # Center-Left: Clock icon + Status text
-    clock_cx, clock_cy = 280, 60
-    draw.ellipse([clock_cx - 11, clock_cy - 11, clock_cx + 11, clock_cy + 11], outline=COLOR_DARK_TEXT, width=2)
-    draw.line([(clock_cx, clock_cy), (clock_cx, clock_cy - 6)], fill=COLOR_DARK_TEXT, width=2)
-    draw.line([(clock_cx, clock_cy), (clock_cx + 5, clock_cy)], fill=COLOR_DARK_TEXT, width=2)
-
-    status_str = f"Графік актуальний станом на {sched.upd_time}"
-    draw.text((302, 60), status_str, font=font_status_txt, fill=COLOR_DARK_TEXT, anchor="lm")
-
-    # Center-Right: Legend (Repositioned to ensure zero text drop-out)
-    leg_start_x = 680
-    badges = [
-        ("В", "Відключені", COLOR_OFF, 30),
-        ("З", "Заживлені", COLOR_ON, 30),
-        ("МЗ", "Можливо заживлені", COLOR_MAYBE, 38),
-    ]
-
-    bx = leg_start_x
-    for tag, label, color, box_w in badges:
-        draw.rounded_rectangle([bx, 45, bx + box_w, 75], radius=4, fill=color)
-        draw.text((bx + box_w // 2, 60), tag, font=font_legend_box, fill=COLOR_DARK_TEXT, anchor="mm")
-        bx += box_w + 8
-        draw.text((bx, 60), label, font=font_legend_lbl, fill=COLOR_DARK_TEXT, anchor="lm")
-        bx += int(len(label) * 8.0) + 18
-
-    # Far-Right: round C4 channel logo
+    # Far-Left: round C4 channel logo
     logo_d = 60
-    logo_cx, logo_cy = width - 68, 60
+    logo_cx, logo_cy = 32 + logo_d // 2, 60
     logo_img = get_logo(logo_d)
     if logo_img is not None:
         im.paste(logo_img, (logo_cx - logo_d // 2, logo_cy - logo_d // 2), logo_img)
     else:
         draw.ellipse([logo_cx - 30, logo_cy - 30, logo_cx + 30, logo_cy + 30], fill=(237, 28, 36))
         draw.text((logo_cx, logo_cy), "C4", font=font_logo_txt, fill=(255, 255, 255), anchor="mm")
+
+    # Date badge (milky background, pure black text) right after the logo
+    badge_x0 = 32 + logo_d + 16
+    badge_x1 = badge_x0 + 218
+    draw.rounded_rectangle([badge_x0, 28, badge_x1, 92], radius=12, fill=COLOR_DATE_BADGE)
+    draw.text(((badge_x0 + badge_x1) // 2, 60), sched.date_str, font=font_date_big, fill=(0, 0, 0), anchor="mm")
+
+    # Clock icon + status text, right after the date badge
+    clock_cx, clock_cy = badge_x1 + 30, 60
+    draw.ellipse([clock_cx - 11, clock_cy - 11, clock_cx + 11, clock_cy + 11], outline=COLOR_DARK_TEXT, width=2)
+    draw.line([(clock_cx, clock_cy), (clock_cx, clock_cy - 6)], fill=COLOR_DARK_TEXT, width=2)
+    draw.line([(clock_cx, clock_cy), (clock_cx + 5, clock_cy)], fill=COLOR_DARK_TEXT, width=2)
+
+    status_str = f"Графік актуальний станом на {sched.upd_time}"
+    draw.text((clock_cx + 22, 60), status_str, font=font_status_txt, fill=COLOR_DARK_TEXT, anchor="lm")
+
+    # Legend: right-aligned, ends exactly at the table's right edge (never past the image edge)
+    badges = [
+        ("В", "Відключені", COLOR_OFF, 30),
+        ("З", "Заживлені", COLOR_ON, 30),
+        ("МЗ", "Можливо заживлені", COLOR_MAYBE, 38),
+    ]
+    item_gap = 22
+    widths = [bw + 8 + int(draw.textlength(label, font=font_legend_lbl)) for _, label, _, bw in badges]
+    legend_w = sum(widths) + item_gap * (len(badges) - 1)
+    bx = width - 32 - legend_w
+    for tag, label, color, box_w in badges:
+        draw.rounded_rectangle([bx, 45, bx + box_w, 75], radius=4, fill=color)
+        draw.text((bx + box_w // 2, 60), tag, font=font_legend_box, fill=COLOR_DARK_TEXT, anchor="mm")
+        bx += box_w + 8
+        draw.text((bx, 60), label, font=font_legend_lbl, fill=COLOR_DARK_TEXT, anchor="lm")
+        bx += int(draw.textlength(label, font=font_legend_lbl)) + item_gap
 
     # ======================================================================= #
     # 2. GREEN BANNER (y: 108 to 152)
@@ -719,14 +722,14 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     # ======================================================================= #
     # 5b. WATERMARK (very transparent)
     # ======================================================================= #
-    im = apply_watermark(im, WATERMARK_TEXT, WATERMARK_ALPHA)
+    im = apply_watermark(im, WATERMARK_TEXT, WATERMARK_ALPHA, center_y=(grid_y0 + grid_y1) // 2)
     draw = ImageDraw.Draw(im)
 
     # ======================================================================= #
     # 6. CURRENT-TIME LINE (red, 70% transparent, table rows only - not on hour bars)
     # ======================================================================= #
     if 0 <= sched.active_slot < 48:
-        mark_x = int(grid_x0 + sched.active_slot * slot_w + slot_w // 2)
+        mark_x = int(round(grid_x0 + sched.active_slot * slot_w))
         line_layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
         ImageDraw.Draw(line_layer).line(
             [(mark_x, grid_y0), (mark_x, grid_y1)],
