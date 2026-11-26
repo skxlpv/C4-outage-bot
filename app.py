@@ -95,11 +95,11 @@ BROWSER_COOKIES = {
 # Visual Colors
 COLOR_CARD_BG = (255, 255, 255)
 COLOR_DATE_BADGE = (240, 236, 225)
-COLOR_GREEN_BANNER = (116, 140, 66)
-COLOR_HOURS_BG = (245, 203, 166)
-COLOR_ON = (172, 196, 116)
-COLOR_OFF = (225, 98, 84)
-COLOR_MAYBE = (122, 168, 198)
+COLOR_GREEN_BANNER = (119, 136, 66)  # #778842
+COLOR_HOURS_BG = (245, 206, 172)     # #f5ceac
+COLOR_ON = (199, 211, 159)           # #c7d39f
+COLOR_OFF = (220, 116, 99)           # #dc7463
+COLOR_MAYBE = (176, 190, 197)        # #b0bec5
 COLOR_BORDER = (255, 255, 255)
 COLOR_DARK_TEXT = (33, 37, 41)
 COLOR_MUTED_GRAY = (120, 144, 156)
@@ -1273,9 +1273,9 @@ def get_dashboard_data():
 
 
 with gr.Blocks(title="Oblenergo Replica Bot Dashboard") as demo:
-    gr.Markdown("# ⚡ Чернівціобленерго — Бот-реплікатор сайту")
+    gr.Markdown("# ⚡ Чернівціобленерго")
     gr.Markdown(
-        "Моніторить сайт `oblenergo.cv.ua/shutdowns/` та надсилає візуальну репліку таблиці в Telegram при кожній зміні."
+        "Моніторить сайт `oblenergo.cv.ua/shutdowns/` та надсилає візуальну таблицю в Telegram при кожній зміні."
     )
 
     with gr.Row():
