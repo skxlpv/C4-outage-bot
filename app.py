@@ -4,6 +4,8 @@ Chernivtsioblenergo Web Replica & Tracker Telegram Bot (Render / HF Edition)
 - Replicates the oblenergo schedule table as an image
 - Pushes an updated table to all subscribers AND channels as soon as the
   schedule on the site changes (no button press needed)
+- Also tracks tomorrow's schedule (site link '?next'): announces it when published,
+  re-posts it when it changes, and shows it on request (/tomorrow)
 - Channels: add the bot as administrator (Post Messages) and it posts the
   current table immediately, then re-posts on every change.
 
@@ -26,6 +28,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -266,10 +269,19 @@ def schedule_changed(old: ScrapedSchedule, new: ScrapedSchedule) -> bool:
     return False
 
 
+@dataclass
+class FetchResult:
+    today: Optional[ScrapedSchedule]
+    tomorrow: Optional[ScrapedSchedule]  # None = not published (when tomorrow_ok) or unknown
+    tomorrow_ok: bool  # False if tomorrow could not be checked (network/HTTP error)
+
+
 class OblenergoScraper:
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
         self.last_schedule: Optional[ScrapedSchedule] = None
+        self.tomorrow_schedule: Optional[ScrapedSchedule] = None
+        self.tomorrow_initialized = False  # becomes True after the first successful tomorrow check
         self.last_fetch_error: Optional[str] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -281,22 +293,62 @@ class OblenergoScraper:
             )
         return self._session
 
-    async def fetch(self) -> Optional[ScrapedSchedule]:
+    async def _get_html(self, url: str) -> Optional[str]:
         session = await self._get_session()
         try:
-            async with session.get(OBLENERGO_URL) as resp:
+            async with session.get(url) as resp:
                 if resp.status != 200:
                     self.last_fetch_error = f"HTTP {resp.status}"
-                    log.warning("Site returned status %s", resp.status)
+                    log.warning("Site returned status %s for %s", resp.status, url)
                     return None
-                html_text = await resp.text()
+                text = await resp.text()
                 self.last_fetch_error = None
+                return text
         except Exception as e:
             self.last_fetch_error = str(e)
             log.warning("Scrape error: %s", e)
             return None
 
-        return self.parse_html(html_text, prev_schedule=self.last_schedule)
+    @staticmethod
+    def find_tomorrow_link(html_text: str) -> Optional[tuple[str, str]]:
+        """The site shows a link to tomorrow's date next to today's date once it is published."""
+        soup = BeautifulSoup(html_text, "html.parser")
+        a = soup.select_one("#gsv_t a")
+        if not a:
+            return None
+        date_txt = a.get_text().strip()
+        if not date_txt:
+            return None
+        href = (a.get("href") or "").strip()
+        url = urljoin(OBLENERGO_URL, href) if href else OBLENERGO_URL.rstrip("/") + "/?next"
+        return date_txt, url
+
+    async def fetch_all(self) -> FetchResult:
+        html_text = await self._get_html(OBLENERGO_URL)
+        if html_text is None:
+            return FetchResult(None, None, False)
+
+        today = self.parse_html(html_text, prev_schedule=self.last_schedule)
+        if today is None:
+            return FetchResult(None, None, False)
+
+        link = self.find_tomorrow_link(html_text)
+        if link is None:
+            return FetchResult(today, None, True)
+
+        date_txt, url = link
+        t_html = await self._get_html(url)
+        if t_html is None:
+            return FetchResult(today, None, False)
+
+        tomorrow = self.parse_html(t_html, prev_schedule=None)
+        self.last_fetch_error = None  # a missing tomorrow table is not an error
+        if tomorrow is None or tomorrow.date_str != date_txt or tomorrow.date_str == today.date_str:
+            log.info("Tomorrow link present (%s) but no valid table behind it", date_txt)
+            return FetchResult(today, None, True)
+
+        tomorrow.active_slot = -1  # no "current time" line on tomorrow's table
+        return FetchResult(today, tomorrow, True)
 
     def parse_html(
             self,
@@ -589,8 +641,9 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📊 Актуальний графік"), KeyboardButton("🔄 Оновити")],
-            [KeyboardButton("⏱ Статус сайту"), KeyboardButton("ℹ️ Довідка")],
+            [KeyboardButton("📊 Актуальний графік"), KeyboardButton("📅 Графік на завтра")],
+            [KeyboardButton("🔄 Оновити"), KeyboardButton("⏱ Статус сайту")],
+            [KeyboardButton("ℹ️ Довідка")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -598,7 +651,17 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 def refresh_inline_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Оновити", callback_data="btn_refresh")]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Оновити", callback_data="btn_refresh"),
+        InlineKeyboardButton("📅 Завтра", callback_data="btn_tomorrow"),
+    ]])
+
+
+def tomorrow_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Оновити", callback_data="btn_refresh_tomorrow"),
+        InlineKeyboardButton("📊 Сьогодні", callback_data="btn_today"),
+    ]])
 
 
 def help_text() -> str:
@@ -608,18 +671,37 @@ def help_text() -> str:
         "відстежує дату та рядок <b>«Станом на»</b>, і генерує візуально ідентичну копію таблиці.\n\n"
         "<b>Команди:</b>\n"
         "• 📊 <b>Актуальний графік</b> — отримати поточну таблицю з сайту.\n"
+        "• 📅 <b>Графік на завтра</b> — таблиця на завтра, якщо вона вже опублікована.\n"
         "• ⏱ <b>Статус сайту</b> — перевірити дату та час публікації.\n"
         "• 🔄 <b>Оновити</b> — примусово перевірити зміни прямо зараз.\n"
-        "• 🔔 Користувачі та канали автоматично отримують сповіщення при кожній зміні графіка на сайті."
+        "• 🔔 Користувачі та канали автоматично отримують сповіщення при кожній зміні графіка "
+        "(на сьогодні та на завтра) та коли публікується графік на завтра."
     )
 
 
-def build_caption(sched: ScrapedSchedule, changed: bool = False) -> str:
-    head = (
-        "🔄 <b>Графік на сайті Обленерго змінився!</b>\n\n"
-        if changed
-        else "📊 <b>Графік відключень з сайту Обленерго</b>\n"
-    )
+def build_caption(
+        sched: ScrapedSchedule,
+        changed: bool = False,
+        tomorrow: bool = False,
+        published: bool = False,
+) -> str:
+    if tomorrow and published:
+        return (
+            f"📅 <b>Опубліковано графік на завтра, {sched.date_str}</b>\n\n"
+            f"⏱ Станом на: <b>{sched.upd_time}</b>"
+        )
+    if tomorrow:
+        head = (
+            "🔄 <b>Графік на завтра змінився!</b>\n\n"
+            if changed
+            else "📅 <b>Графік відключень на завтра</b>\n"
+        )
+    else:
+        head = (
+            "🔄 <b>Графік на сайті Обленерго змінився!</b>\n\n"
+            if changed
+            else "📊 <b>Графік відключень з сайту Обленерго</b>\n"
+        )
     return f"{head}📅 Дата: <b>{sched.date_str}</b>\n⏱ Станом на: <b>{sched.upd_time}</b>"
 
 
@@ -635,9 +717,8 @@ async def _send_one(bot, chat_id: int, png_bytes: bytes, caption: str) -> None:
     )
 
 
-async def broadcast(bot, sched: ScrapedSchedule, changed: bool = True) -> None:
+async def broadcast(bot, sched: ScrapedSchedule, caption: str) -> None:
     png_bytes = render_replica_table(sched)
-    caption = build_caption(sched, changed)
 
     targets = [(uid, subscribers) for uid in list(subscribers.subscribers)] + \
               [(cid, channels) for cid in list(channels.subscribers)]
@@ -680,35 +761,83 @@ async def save_schedule_state(sched: ScrapedSchedule) -> None:
         await remote.set("oblenergo:schedule", sched.to_json())
 
 
+async def save_tomorrow_state(sched: Optional[ScrapedSchedule]) -> None:
+    if remote.enabled:
+        await remote.set("oblenergo:schedule_tomorrow", sched.to_json() if sched else "null")
+
+
+async def handle_tomorrow(bot, new_t: Optional[ScrapedSchedule]) -> None:
+    """Announce a newly published tomorrow table, or a change of an existing one."""
+    old_t = scraper.tomorrow_schedule
+    first_check = not scraper.tomorrow_initialized
+    scraper.tomorrow_schedule = new_t
+    scraper.tomorrow_initialized = True
+
+    if first_check:
+        # Baseline only (no previous state known) - avoids re-announcing after every restart
+        await save_tomorrow_state(new_t)
+        log.info("Tomorrow baseline: %s", new_t.date_str if new_t else "not published")
+        return
+
+    if new_t is None:
+        if old_t is not None:
+            await save_tomorrow_state(None)
+        return
+
+    if old_t is None or old_t.date_str != new_t.date_str:
+        log.info("🔔 Tomorrow schedule published: %s", new_t.date_str)
+        await save_tomorrow_state(new_t)
+        await broadcast(bot, new_t, build_caption(new_t, tomorrow=True, published=True))
+    elif schedule_changed(old_t, new_t):
+        log.info("🔔 Tomorrow schedule changed: %s (upd %s)", new_t.date_str, new_t.upd_time)
+        await save_tomorrow_state(new_t)
+        await broadcast(bot, new_t, build_caption(new_t, changed=True, tomorrow=True))
+
+
 async def refresh_and_notify(bot) -> Optional[ScrapedSchedule]:
-    """Fetch the site. If the schedule changed, broadcast to everyone.
+    """Fetch the site (today + tomorrow). Broadcast to everyone if anything changed.
 
     Used by the background loop AND by buttons, so an update found by a button
     press is never "swallowed" without notifying subscribers/channels.
-    Returns the fresh schedule, or None if the site could not be read.
+    Returns today's fresh schedule, or None if the site could not be read.
     """
     global _update_lock
     if _update_lock is None:
         _update_lock = asyncio.Lock()
 
     async with _update_lock:
-        new = await scraper.fetch()
-        if not new:
+        res = await scraper.fetch_all()
+        today = res.today
+        if not today:
             return None
 
         old = scraper.last_schedule
-        scraper.last_schedule = new
+        prev_tomorrow = scraper.tomorrow_schedule
+        scraper.last_schedule = today
 
         if old is None:
-            log.info("Initialized scraper: date=%s, upd=%s", new.date_str, new.upd_time)
-            await save_schedule_state(new)
-            return new
+            log.info("Initialized scraper: date=%s, upd=%s", today.date_str, today.upd_time)
+            await save_schedule_state(today)
+        elif schedule_changed(old, today):
+            await save_schedule_state(today)
+            # Midnight rollover: if tomorrow's table was already announced and today's table
+            # is identical to it, there is nothing new to tell people.
+            rolled_over = old.date_str != today.date_str
+            already_announced = (
+                    rolled_over
+                    and prev_tomorrow is not None
+                    and prev_tomorrow.date_str == today.date_str
+                    and not schedule_changed(prev_tomorrow, today)
+            )
+            if already_announced:
+                log.info("New day %s already announced as tomorrow's schedule", today.date_str)
+            else:
+                log.info("🔔 Schedule updated! Date: %s, Upd: %s", today.date_str, today.upd_time)
+                await broadcast(bot, today, build_caption(today, changed=True))
 
-        if schedule_changed(old, new):
-            log.info("🔔 Schedule updated! Date: %s, Upd: %s", new.date_str, new.upd_time)
-            await save_schedule_state(new)
-            await broadcast(bot, new, changed=True)
-        return new
+        if res.tomorrow_ok:
+            await handle_tomorrow(bot, res.tomorrow)
+        return today
 
 
 async def monitor_loop(bot) -> None:
@@ -739,6 +868,16 @@ async def post_init(app: Application) -> None:
             )
         except Exception as e:
             log.warning("Could not restore schedule: %s", e)
+
+    raw_t = await remote.get("oblenergo:schedule_tomorrow")
+    if raw_t is not None:
+        scraper.tomorrow_initialized = True
+        if raw_t != "null":
+            try:
+                scraper.tomorrow_schedule = ScrapedSchedule.from_json(raw_t)
+                log.info("Restored tomorrow schedule: date=%s", scraper.tomorrow_schedule.date_str)
+            except Exception as e:
+                log.warning("Could not restore tomorrow schedule: %s", e)
 
     if not remote.enabled:
         log.warning(
@@ -800,16 +939,52 @@ async def send_schedule_replica(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+async def send_tomorrow(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    try:
+        await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
+    except Exception:
+        pass
+
+    if scraper.tomorrow_schedule is None:
+        await refresh_and_notify(ctx.bot)
+
+    sched = scraper.tomorrow_schedule
+    if not sched:
+        if scraper.last_fetch_error:
+            await ctx.bot.send_message(
+                chat_id,
+                f"🔴 <b>Не вдалося перевірити графік на завтра</b>\n<i>{scraper.last_fetch_error}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await ctx.bot.send_message(chat_id, "Графік на завтра не знайдено")
+        return
+
+    await ctx.bot.send_photo(
+        chat_id=chat_id,
+        photo=io.BytesIO(render_replica_table(sched)),
+        caption=build_caption(sched, tomorrow=True),
+        parse_mode=ParseMode.HTML,
+        reply_markup=tomorrow_inline_keyboard(),
+    )
+
+
 async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sched = scraper.last_schedule
     if not sched:
         await update.effective_message.reply_text("⏳ Дані ще завантажуються, спробуйте через кілька секунд.")
         return
 
+    t = scraper.tomorrow_schedule
+    tomorrow_line = (
+        f"опубліковано на <b>{t.date_str}</b> (станом на {t.upd_time})" if t else "<b>не опубліковано</b>"
+    )
     text = (
         f"🌐 <b>Статус сайту Чернівціобленерго:</b>\n\n"
         f"• 📅 Дата в графіку: <b>{sched.date_str}</b>\n"
         f"• ⏱ Актуально станом на: <b>{sched.upd_time}</b>\n"
+        f"• 🗓 Графік на завтра: {tomorrow_line}\n"
         f"• 👥 Підписників бота: <b>{len(subscribers.subscribers)}</b>\n"
         f"• 📣 Каналів: <b>{len(channels.subscribers)}</b>\n"
         f"• 🔄 Період моніторингу: <b>кожні {CHECK_INTERVAL_SECONDS} сек.</b>"
@@ -817,33 +992,55 @@ async def on_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
+async def _edit_photo(q, ctx, update, sched: ScrapedSchedule, caption: str, keyboard, resend) -> None:
+    try:
+        await q.edit_message_media(
+            media=InputMediaPhoto(
+                io.BytesIO(render_replica_table(sched)),
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            ),
+            reply_markup=keyboard,
+        )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            await resend(update, ctx)
+    except Exception:
+        await resend(update, ctx)
+
+
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer("Перевіряємо оновлення...")
+
     if q.data == "btn_refresh":
         sched = await refresh_and_notify(ctx.bot) or scraper.last_schedule
         if sched:
-            png_bytes = render_replica_table(sched)
-            try:
-                await q.edit_message_media(
-                    media=InputMediaPhoto(
-                        io.BytesIO(png_bytes),
-                        caption=build_caption(sched),
-                        parse_mode=ParseMode.HTML,
-                    ),
-                    reply_markup=refresh_inline_keyboard(),
-                )
-            except BadRequest as e:
-                if "not modified" not in str(e).lower():
-                    await send_schedule_replica(update, ctx)
-            except Exception:
-                await send_schedule_replica(update, ctx)
+            await _edit_photo(q, ctx, update, sched, build_caption(sched),
+                              refresh_inline_keyboard(), send_schedule_replica)
+
+    elif q.data == "btn_refresh_tomorrow":
+        await refresh_and_notify(ctx.bot)
+        sched = scraper.tomorrow_schedule
+        if sched:
+            await _edit_photo(q, ctx, update, sched, build_caption(sched, tomorrow=True),
+                              tomorrow_inline_keyboard(), send_tomorrow)
+        else:
+            await send_tomorrow(update, ctx)
+
+    elif q.data == "btn_tomorrow":
+        await send_tomorrow(update, ctx)
+
+    elif q.data == "btn_today":
+        await send_schedule_replica(update, ctx)
 
 
 async def on_text_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.effective_message.text or "").strip()
     if text in ("📊 Актуальний графік", "/table"):
         await send_schedule_replica(update, ctx)
+    elif text in ("📅 Графік на завтра", "/tomorrow"):
+        await send_tomorrow(update, ctx)
     elif text in ("🔄 Оновити", "/check"):
         await refresh_and_notify(ctx.bot)
         await send_schedule_replica(update, ctx)
@@ -913,6 +1110,7 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("help", on_help))
     app.add_handler(CommandHandler("table", send_schedule_replica))
+    app.add_handler(CommandHandler("tomorrow", send_tomorrow))
     app.add_handler(CommandHandler("status", on_status))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_menu))
