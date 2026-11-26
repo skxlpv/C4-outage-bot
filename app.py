@@ -305,21 +305,22 @@ class ScrapedSchedule:
 
 
 def schedule_changed(old: ScrapedSchedule, new: ScrapedSchedule) -> bool:
-    """True if the site published something new.
+    """True only if the schedule date or any upcoming/future slot changed.
 
-    Elapsed or trimmed half-hour cells are ignored (the site drops them as the
-    day goes on), so only the date, the 'Станом на' time, and upcoming slots
-    actually present on the site matter.
+    - Ignores 'Станом на' (upd_time), because the site updates it every 30 min
+      even when the schedule itself has not changed.
+    - Ignores elapsed/past half-hour slots and any leading cells stripped by
+      the site as time passes, comparing only upcoming slots actually present.
     """
-    if old.date_str != new.date_str or old.upd_time != new.upd_time:
+    if old.date_str != new.date_str:
         return True
 
     # Never compare slots that were padded/preserved before start_slot
     start = max(old.start_slot, new.start_slot, 0)
 
-    # For today's table (active_slot >= 0), also skip elapsed slots plus a
-    # 60-second boundary buffer so slight clock skew between Render and the
-    # oblenergo server around :00 / :30 cannot cause false positives.
+    # For today's table (active_slot >= 0), also skip past half-hour slots plus
+    # a 60-second boundary buffer so slight clock skew around :00 / :30 cannot
+    # cause false positives.
     if old.active_slot >= 0 or new.active_slot >= 0:
         now = datetime.now(TZ)
         now_buf = now + timedelta(seconds=60)
@@ -327,6 +328,9 @@ def schedule_changed(old: ScrapedSchedule, new: ScrapedSchedule) -> bool:
             now_buf.hour * 2 + (1 if now_buf.minute >= 30 else 0)
         )
         start = max(start, old.active_slot, new.active_slot, buf_slot)
+
+    if start >= 48:
+        return False
 
     for q in set(old.slots) | set(new.slots):
         if old.slots.get(q, [])[start:] != new.slots.get(q, [])[start:]:
@@ -496,7 +500,8 @@ class OblenergoScraper:
         now = datetime.now(TZ)
         active_slot = now.hour * 2 + (1 if now.minute >= 30 else 0)
 
-        content_repr = f"{date_str}_{upd_time}_{json.dumps(group_slots, sort_keys=True)}"
+        # Hash only date + slots (not upd_time, which changes every 30 min on its own)
+        content_repr = f"{date_str}_{json.dumps(group_slots, sort_keys=True)}"
         content_hash = hashlib.md5(content_repr.encode()).hexdigest()
 
         return ScrapedSchedule(
@@ -731,7 +736,7 @@ def help_text() -> str:
     return (
         "💡 <b>Бот-реплікатор сайту Чернівціобленерго</b>\n\n"
         "Бот підключається напряму до <code>oblenergo.cv.ua/shutdowns/</code>, "
-        "відстежує оновлення графіків та генерує таблицю.\n\n"
+        "відстежує зміни графіків та генерує таблицю.\n\n"
         "<b>Кнопки меню:</b>\n"
         "• <b>Графік на сьогодні</b> — отримати поточну таблицю з сайту.\n"
         "• <b>Графік на завтра</b> — таблиця на завтра, якщо вона вже опублікована.\n"
@@ -959,7 +964,7 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg = (
         "👋 <b>Вітаємо!</b>\n\n"
         "Ви успішно підписалися на сповіщення про графіки з сайту <b>Чернівціобленерго</b>.\n"
-        "Щойно обленерго оновить статус або змінить години відключень, бот надішле вам оновлену таблицю."
+        "Щойно обленерго змінить графік відключень, бот надішле вам оновлену таблицю."
     )
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=main_reply_keyboard())
     await send_schedule_replica(update, ctx)
