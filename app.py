@@ -109,7 +109,12 @@ COLOR_MUTED_GRAY = (120, 144, 156)
 COLOR_ACTIVE_HOUR = (40, 63, 159)    # #283f9f
 COLOR_ACTIVE_DOTS = (240, 244, 255)
 
-IMG_SCALE = 2560 / 1440  # 2560px wide (native Telegram high-res limit)
+# Render at 3840x1952 (1.5x supersampled) and downsample to 2560x1302 for crisp edges
+RENDER_W = 3840
+RENDER_H = 1952
+OUT_W = 2560
+OUT_H = 1302
+IMG_SCALE = RENDER_W / 1440  # 8/3
 
 UK_MONTHS_GENITIVE = {
     1: "січня",
@@ -564,7 +569,7 @@ scraper = OblenergoScraper()
 LOGO_C4_B64 = logo
 
 WATERMARK_TEXT = "Чернівці | С4"
-WATERMARK_ALPHA = 48  # 0..255, very transparent
+WATERMARK_ALPHA = 24  # 0..255 (halved from 48 for subtler transparency)
 
 _logo_cache: dict[int, Image.Image] = {}
 
@@ -598,6 +603,7 @@ def load_font(size: int, bold: bool = False):
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     ]
     for p in candidates:
         if os.path.exists(p):
@@ -605,31 +611,34 @@ def load_font(size: int, bold: bool = False):
                 return ImageFont.truetype(p, size)
             except Exception:
                 pass
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def render_replica_table(sched: ScrapedSchedule) -> bytes:
-    width = 2560
-    height = 1174
+    width = RENDER_W
+    height = RENDER_H
 
     im = Image.new("RGB", (width, height), COLOR_CARD_BG)
     draw = ImageDraw.Draw(im)
 
-    # Fonts (scaled for 2560x1174 crisp rendering)
+    # Fonts (scaled at 3840x1952 then LANCZOS-downsampled to 2560x1302)
     font_date_big = load_font(_s(28), bold=True)
-    font_status_txt = load_font(_s(15), bold=True)
-    font_legend_box = load_font(_s(12), bold=True)
-    font_legend_lbl = load_font(_s(13), bold=False)
+    font_status_txt = load_font(_s(16), bold=True)
+    font_legend_box = load_font(_s(13), bold=True)
+    font_legend_lbl = load_font(_s(14), bold=False)
     font_logo_txt = load_font(_s(20), bold=True)
-    font_banner_txt = load_font(_s(19), bold=True)
-    font_hour_h = load_font(_s(12), bold=True)
-    font_grp_lbl = load_font(_s(9), bold=False)
-    font_grp_num = load_font(_s(16), bold=True)
-    font_cell = load_font(_s(11), bold=True)
-    font_header_h = load_font(_s(13), bold=True)
+    font_banner_txt = load_font(_s(20), bold=True)
+    font_hour_h = load_font(_s(13), bold=True)
+    font_grp_lbl = load_font(_s(10.5), bold=False)
+    font_grp_num = load_font(_s(18), bold=True)
+    font_cell = load_font(_s(13.5), bold=True)
+    font_header_h = load_font(_s(14.5), bold=True)
 
     margin_x = _s(32)
-    border_w = max(1, _s(1))
+    border_w = max(2, _s(1.2))
 
     # 1. TOP HEADER BAR
     logo_d = _s(60)
@@ -647,7 +656,7 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     draw.rounded_rectangle([badge_x0, _s(28), badge_x1, _s(92)], radius=_s(12), fill=COLOR_DATE_BADGE)
     draw.text(((badge_x0 + badge_x1) // 2, _s(60)), sched.date_str, font=font_date_big, fill=(0, 0, 0), anchor="mm")
 
-    clock_cx, clock_cy = badge_x1 + _s(30), _s(60)
+    clock_cx, clock_cy = badge_x1 + _s(28), _s(60)
     clock_r = _s(11)
     clock_w = max(2, _s(2))
     draw.ellipse([clock_cx - clock_r, clock_cy - clock_r, clock_cx + clock_r, clock_cy + clock_r],
@@ -656,20 +665,20 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     draw.line([(clock_cx, clock_cy), (clock_cx + _s(5), clock_cy)], fill=COLOR_DARK_TEXT, width=clock_w)
 
     status_str = f"Графік актуальний станом на {sched.upd_time}"
-    draw.text((clock_cx + _s(22), _s(60)), status_str, font=font_status_txt, fill=COLOR_DARK_TEXT, anchor="lm")
+    draw.text((clock_cx + _s(20), _s(60)), status_str, font=font_status_txt, fill=COLOR_DARK_TEXT, anchor="lm")
 
     badges = [
-        ("В", "Відключені", COLOR_OFF, _s(30)),
-        ("З", "Заживлені", COLOR_ON, _s(30)),
-        ("МЗ", "Можливо заживлені", COLOR_MAYBE, _s(38)),
+        ("В", "Відключені", COLOR_OFF, _s(32)),
+        ("З", "Заживлені", COLOR_ON, _s(32)),
+        ("МЗ", "Можливо заживлені", COLOR_MAYBE, _s(40)),
     ]
-    item_gap = _s(22)
+    item_gap = _s(20)
     box_pad = _s(8)
     widths = [bw + box_pad + int(draw.textlength(label, font=font_legend_lbl)) for _, label, _, bw in badges]
     legend_w = sum(widths) + item_gap * (len(badges) - 1)
     bx = width - margin_x - legend_w
     for tag, label, color, box_w in badges:
-        draw.rounded_rectangle([bx, _s(45), bx + box_w, _s(75)], radius=_s(4), fill=color)
+        draw.rounded_rectangle([bx, _s(44), bx + box_w, _s(76)], radius=_s(4), fill=color)
         draw.text((bx + box_w // 2, _s(60)), tag, font=font_legend_box, fill=COLOR_DARK_TEXT, anchor="mm")
         bx += box_w + box_pad
         draw.text((bx, _s(60)), label, font=font_legend_lbl, fill=COLOR_DARK_TEXT, anchor="lm")
@@ -683,7 +692,7 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
 
     # 3. TABLE GRID GEOMETRY
     left_col_x0 = margin_x
-    left_col_w = _s(120)
+    left_col_w = _s(126)
     grid_x0 = left_col_x0 + left_col_w
     grid_x1 = width - margin_x
     grid_w = grid_x1 - grid_x0
@@ -691,13 +700,13 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     hour_w = slot_w * 2
 
     top_hour_y0 = _s(162)
-    top_hour_y1 = _s(202)
+    top_hour_y1 = _s(204)
     marker_bar_h = _s(10)
-    row_h = _s(33)
+    row_h = _s(38)
     grid_y0 = top_hour_y1
     grid_y1 = grid_y0 + 12 * row_h
     bot_hour_y0 = grid_y1
-    bot_hour_y1 = bot_hour_y0 + _s(34)
+    bot_hour_y1 = bot_hour_y0 + _s(36)
 
     draw.rectangle([left_col_x0, top_hour_y0, grid_x1, top_hour_y1], fill=COLOR_HOURS_BG)
     draw.text(
@@ -707,28 +716,27 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
 
     hour_text_y = top_hour_y0 + (top_hour_y1 - top_hour_y0 - marker_bar_h) // 2
     for h in range(24):
-        hx = grid_x0 + h * hour_w
+        hx = int(round(grid_x0 + h * hour_w))
         draw.line([(hx, top_hour_y0), (hx, top_hour_y1)], fill=COLOR_BORDER, width=border_w)
-        draw.text((hx + hour_w / 2, hour_text_y), f"{h:02d}:00", font=font_hour_h,
+        draw.text((grid_x0 + h * hour_w + hour_w / 2, hour_text_y), f"{h:02d}:00", font=font_hour_h,
                   fill=COLOR_DARK_TEXT, anchor="mm")
 
-    # 4. 12 GROUP ROWS
+    # 4. 12 GROUP ROWS (fill cells first, then draw uniform crisp grid lines on top)
     for q in range(1, 13):
         ry0 = grid_y0 + (q - 1) * row_h
         ry1 = ry0 + row_h
 
         bg_grp = (255, 255, 255) if q % 2 != 0 else (248, 250, 252)
         draw.rectangle([left_col_x0, ry0, grid_x0, ry1], fill=bg_grp)
-        draw.line([(left_col_x0, ry1), (grid_x1, ry1)], fill=COLOR_BORDER, width=border_w)
 
-        draw.text((left_col_x0 + _s(12), (ry0 + ry1) // 2), "Г Р У П А", font=font_grp_lbl, fill=COLOR_MUTED_GRAY,
+        draw.text((left_col_x0 + _s(10), (ry0 + ry1) // 2), "Г Р У П А", font=font_grp_lbl, fill=COLOR_MUTED_GRAY,
                   anchor="lm")
-        draw.text((grid_x0 - _s(18), (ry0 + ry1) // 2), str(q), font=font_grp_num, fill=COLOR_DARK_TEXT, anchor="rm")
+        draw.text((grid_x0 - _s(14), (ry0 + ry1) // 2), str(q), font=font_grp_num, fill=COLOR_DARK_TEXT, anchor="rm")
 
         q_slots = sched.slots.get(q, ["з"] * 48)
         for s in range(48):
-            sx0 = int(grid_x0 + s * slot_w)
-            sx1 = int(grid_x0 + (s + 1) * slot_w)
+            sx0 = int(round(grid_x0 + s * slot_w))
+            sx1 = int(round(grid_x0 + (s + 1) * slot_w))
             state = q_slots[s]
 
             if state == "в":
@@ -738,16 +746,25 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
             else:
                 fill_c = COLOR_ON
 
-            draw.rectangle([sx0, ry0, sx1, ry1], fill=fill_c, outline=COLOR_BORDER, width=border_w)
-            draw.text(((sx0 + sx1) // 2, (ry0 + ry1) // 2), state, font=font_cell, fill=COLOR_DARK_TEXT, anchor="mm")
+            draw.rectangle([sx0, ry0, sx1, ry1], fill=fill_c)
+            draw.text(((sx0 + sx1) // 2, (ry0 + ry1) // 2), state.upper(), font=font_cell,
+                      fill=COLOR_DARK_TEXT, anchor="mm")
+
+    # Uniform white cell borders (vertical + horizontal)
+    for s in range(49):
+        sx = int(round(grid_x0 + s * slot_w))
+        draw.line([(sx, grid_y0), (sx, grid_y1)], fill=COLOR_BORDER, width=border_w)
+    for q in range(13):
+        ry = grid_y0 + q * row_h
+        draw.line([(left_col_x0, ry), (grid_x1, ry)], fill=COLOR_BORDER, width=border_w)
 
     # 5. BOTTOM HOURS ROW
     draw.rectangle([left_col_x0, bot_hour_y0, grid_x1, bot_hour_y1], fill=COLOR_HOURS_BG)
     for h in range(24):
-        hx = grid_x0 + h * hour_w
+        hx = int(round(grid_x0 + h * hour_w))
         draw.line([(hx, bot_hour_y0), (hx, bot_hour_y1)], fill=COLOR_BORDER, width=border_w)
-        draw.text((hx + hour_w / 2, (bot_hour_y0 + bot_hour_y1) // 2), f"{h:02d}:00", font=font_hour_h,
-                  fill=COLOR_DARK_TEXT, anchor="mm")
+        draw.text((grid_x0 + h * hour_w + hour_w / 2, (bot_hour_y0 + bot_hour_y1) // 2), f"{h:02d}:00",
+                  font=font_hour_h, fill=COLOR_DARK_TEXT, anchor="mm")
 
     # 5b. WATERMARK
     im = apply_watermark(im, WATERMARK_TEXT, WATERMARK_ALPHA, center_y=(grid_y0 + grid_y1) // 2)
@@ -756,8 +773,8 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     # 6. CURRENT-HOUR BLUE MARKER (#283f9f, moves by whole hour)
     if 0 <= sched.active_slot < 48:
         active_hour = sched.active_slot // 2
-        hx0 = int(grid_x0 + (active_hour * 2) * slot_w)
-        hx1 = int(grid_x0 + ((active_hour + 1) * 2) * slot_w)
+        hx0 = int(round(grid_x0 + (active_hour * 2) * slot_w))
+        hx1 = int(round(grid_x0 + ((active_hour + 1) * 2) * slot_w))
 
         # Bold top bar above Group 1 with 3 centered white dots
         bar_y0 = grid_y0 - marker_bar_h
@@ -779,6 +796,9 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
         for q in range(1, 13):
             ry1 = grid_y0 + q * row_h
             draw.line([(hx0, ry1), (hx1, ry1)], fill=COLOR_ACTIVE_HOUR, width=sep_w)
+
+    # Downsample 3840x1952 -> 2560x1302 for crisp anti-aliased edges and native Telegram max res
+    im = im.resize((OUT_W, OUT_H), Image.LANCZOS)
 
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=True)
