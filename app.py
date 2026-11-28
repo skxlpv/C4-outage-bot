@@ -70,6 +70,9 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 TZ = ZoneInfo("Europe/Kyiv")
 BOT_STARTED_AT = datetime.now(TZ)
 
+CONFLICT_COUNT = 0
+LAST_CONFLICT_AT: Optional[datetime] = None
+
 # Scraper Headers from cURL
 BROWSER_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -103,8 +106,10 @@ COLOR_MAYBE = (176, 190, 197)        # #b0bec5
 COLOR_BORDER = (255, 255, 255)
 COLOR_DARK_TEXT = (33, 37, 41)
 COLOR_MUTED_GRAY = (120, 144, 156)
-COLOR_LINE_MARKER = (220, 30, 30)
-LINE_MARKER_ALPHA = 77
+COLOR_ACTIVE_HOUR = (40, 63, 159)    # #283f9f
+COLOR_ACTIVE_DOTS = (240, 244, 255)
+
+IMG_SCALE = 2560 / 1440  # 2560px wide (native Telegram high-res limit)
 
 UK_MONTHS_GENITIVE = {
     1: "січня",
@@ -125,6 +130,10 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", le
 # httpx logs full Telegram URLs (which contain the bot token) at INFO level
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("svitlo-replica-bot")
+
+
+def _s(val: float) -> int:
+    return int(round(val * IMG_SCALE))
 
 
 def format_uk_date(date_str: str) -> str:
@@ -154,20 +163,24 @@ class RemoteKV:
         self.token = token
         self.enabled = bool(url and token)
         self.last_error: Optional[str] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=aiohttp.ClientTimeout(total=8),
+            )
+        return self._session
 
     async def _cmd(self, *args):
-        timeout = aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.post(
-                self.url,
-                json=list(args),
-                headers={"Authorization": f"Bearer {self.token}"},
-            ) as r:
-                data = await r.json()
-                if r.status >= 400 or data.get("error"):
-                    raise RuntimeError(data.get("error") or f"HTTP {r.status}")
-                self.last_error = None
-                return data.get("result")
+        s = await self._get_session()
+        async with s.post(self.url, json=list(args)) as r:
+            data = await r.json()
+            if r.status >= 400 or data.get("error"):
+                raise RuntimeError(data.get("error") or f"HTTP {r.status}")
+            self.last_error = None
+            return data.get("result")
 
     async def get(self, key: str) -> Optional[str]:
         if not self.enabled:
@@ -219,7 +232,13 @@ class SubscriberStore:
         self.path = path
         self.remote_key = remote_key
         self.subscribers: set[int] = set()
+        self._save_lock: Optional[asyncio.Lock] = None
         self.load()
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._save_lock is None:
+            self._save_lock = asyncio.Lock()
+        return self._save_lock
 
     def _merge(self, data) -> None:
         for uid in data:
@@ -245,6 +264,31 @@ class SubscriberStore:
             except Exception as e:
                 log.warning("Bad remote data for %s: %s", self.remote_key, e)
 
+    def _write_local(self, payload: str) -> None:
+        try:
+            self.path.write_text(payload, encoding="utf-8")
+        except Exception as e:
+            log.warning("Failed saving %s: %s", self.path, e)
+
+    async def save_async(self) -> None:
+        async with self._get_lock():
+            payload = json.dumps(sorted(self.subscribers))
+            self._write_local(payload)
+            if remote.enabled:
+                await remote.set(self.remote_key, payload)
+
+    async def add_async(self, uid: int) -> bool:
+        if uid not in self.subscribers:
+            self.subscribers.add(uid)
+            await self.save_async()
+            return True
+        return False
+
+    async def remove_async(self, uid: int) -> None:
+        if uid in self.subscribers:
+            self.subscribers.discard(uid)
+            await self.save_async()
+
     def add(self, uid: int) -> bool:
         if uid not in self.subscribers:
             self.subscribers.add(uid)
@@ -259,10 +303,7 @@ class SubscriberStore:
 
     def save(self) -> None:
         payload = json.dumps(sorted(self.subscribers))
-        try:
-            self.path.write_text(payload, encoding="utf-8")
-        except Exception as e:
-            log.warning("Failed saving %s: %s", self.path, e)
+        self._write_local(payload)
         if remote.enabled:
             _fire_and_forget(remote.set(self.remote_key, payload))
 
@@ -426,7 +467,7 @@ class OblenergoScraper:
             log.info("Tomorrow link present (%s) but no valid table behind it", date_txt)
             return FetchResult(today, None, True)
 
-        tomorrow.active_slot = -1  # no "current time" line on tomorrow's table
+        tomorrow.active_slot = -1  # no "current hour" marker on tomorrow's table
         return FetchResult(today, tomorrow, True)
 
     def parse_html(
@@ -475,7 +516,7 @@ class OblenergoScraper:
                 else:
                     q_slots.append("з")
 
-            # As the day progresses, the site removes elapsed 30-min cells.
+            # As the day progresses, the site removes elapsed cells.
             # Preserve earlier slots from prev_schedule (same date).
             if len(q_slots) < 48:
                 start_offset = 48 - len(q_slots)
@@ -547,7 +588,7 @@ def apply_watermark(base: Image.Image, text: str, alpha: int, center_y: Optional
     w, h = base.size
     layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     ld = ImageDraw.Draw(layer)
-    wm_font = load_font(96, bold=True)
+    wm_font = load_font(_s(96), bold=True)
     cy = center_y if center_y is not None else h // 2
     ld.text((w // 2, cy), text, font=wm_font, fill=(33, 37, 41, alpha), anchor="mm")
     return Image.alpha_composite(base.convert("RGBA"), layer).convert("RGB")
@@ -568,86 +609,95 @@ def load_font(size: int, bold: bool = False):
 
 
 def render_replica_table(sched: ScrapedSchedule) -> bytes:
-    width = 1440
-    height = 660
+    width = 2560
+    height = 1174
 
     im = Image.new("RGB", (width, height), COLOR_CARD_BG)
     draw = ImageDraw.Draw(im)
 
-    # Fonts
-    font_date_big = load_font(28, bold=True)
-    font_status_txt = load_font(15, bold=True)
-    font_legend_box = load_font(12, bold=True)
-    font_legend_lbl = load_font(13, bold=False)
-    font_logo_txt = load_font(20, bold=True)
-    font_banner_txt = load_font(19, bold=True)
-    font_hour_h = load_font(12, bold=True)
-    font_grp_lbl = load_font(9, bold=False)
-    font_grp_num = load_font(16, bold=True)
-    font_cell = load_font(11, bold=True)
-    font_header_h = load_font(13, bold=True)
+    # Fonts (scaled for 2560x1174 crisp rendering)
+    font_date_big = load_font(_s(28), bold=True)
+    font_status_txt = load_font(_s(15), bold=True)
+    font_legend_box = load_font(_s(12), bold=True)
+    font_legend_lbl = load_font(_s(13), bold=False)
+    font_logo_txt = load_font(_s(20), bold=True)
+    font_banner_txt = load_font(_s(19), bold=True)
+    font_hour_h = load_font(_s(12), bold=True)
+    font_grp_lbl = load_font(_s(9), bold=False)
+    font_grp_num = load_font(_s(16), bold=True)
+    font_cell = load_font(_s(11), bold=True)
+    font_header_h = load_font(_s(13), bold=True)
+
+    margin_x = _s(32)
+    border_w = max(1, _s(1))
 
     # 1. TOP HEADER BAR
-    logo_d = 60
-    logo_cx, logo_cy = 32 + logo_d // 2, 60
+    logo_d = _s(60)
+    logo_cx, logo_cy = margin_x + logo_d // 2, _s(60)
     logo_img = get_logo(logo_d)
     if logo_img is not None:
         im.paste(logo_img, (logo_cx - logo_d // 2, logo_cy - logo_d // 2), logo_img)
     else:
-        draw.ellipse([logo_cx - 30, logo_cy - 30, logo_cx + 30, logo_cy + 30], fill=(237, 28, 36))
+        r_logo = _s(30)
+        draw.ellipse([logo_cx - r_logo, logo_cy - r_logo, logo_cx + r_logo, logo_cy + r_logo], fill=(237, 28, 36))
         draw.text((logo_cx, logo_cy), "C4", font=font_logo_txt, fill=(255, 255, 255), anchor="mm")
 
-    badge_x0 = 32 + logo_d + 16
-    badge_x1 = badge_x0 + 218
-    draw.rounded_rectangle([badge_x0, 28, badge_x1, 92], radius=12, fill=COLOR_DATE_BADGE)
-    draw.text(((badge_x0 + badge_x1) // 2, 60), sched.date_str, font=font_date_big, fill=(0, 0, 0), anchor="mm")
+    badge_x0 = margin_x + logo_d + _s(16)
+    badge_x1 = badge_x0 + _s(218)
+    draw.rounded_rectangle([badge_x0, _s(28), badge_x1, _s(92)], radius=_s(12), fill=COLOR_DATE_BADGE)
+    draw.text(((badge_x0 + badge_x1) // 2, _s(60)), sched.date_str, font=font_date_big, fill=(0, 0, 0), anchor="mm")
 
-    clock_cx, clock_cy = badge_x1 + 30, 60
-    draw.ellipse([clock_cx - 11, clock_cy - 11, clock_cx + 11, clock_cy + 11], outline=COLOR_DARK_TEXT, width=2)
-    draw.line([(clock_cx, clock_cy), (clock_cx, clock_cy - 6)], fill=COLOR_DARK_TEXT, width=2)
-    draw.line([(clock_cx, clock_cy), (clock_cx + 5, clock_cy)], fill=COLOR_DARK_TEXT, width=2)
+    clock_cx, clock_cy = badge_x1 + _s(30), _s(60)
+    clock_r = _s(11)
+    clock_w = max(2, _s(2))
+    draw.ellipse([clock_cx - clock_r, clock_cy - clock_r, clock_cx + clock_r, clock_cy + clock_r],
+                 outline=COLOR_DARK_TEXT, width=clock_w)
+    draw.line([(clock_cx, clock_cy), (clock_cx, clock_cy - _s(6))], fill=COLOR_DARK_TEXT, width=clock_w)
+    draw.line([(clock_cx, clock_cy), (clock_cx + _s(5), clock_cy)], fill=COLOR_DARK_TEXT, width=clock_w)
 
     status_str = f"Графік актуальний станом на {sched.upd_time}"
-    draw.text((clock_cx + 22, 60), status_str, font=font_status_txt, fill=COLOR_DARK_TEXT, anchor="lm")
+    draw.text((clock_cx + _s(22), _s(60)), status_str, font=font_status_txt, fill=COLOR_DARK_TEXT, anchor="lm")
 
     badges = [
-        ("В", "Відключені", COLOR_OFF, 30),
-        ("З", "Заживлені", COLOR_ON, 30),
-        ("МЗ", "Можливо заживлені", COLOR_MAYBE, 38),
+        ("В", "Відключені", COLOR_OFF, _s(30)),
+        ("З", "Заживлені", COLOR_ON, _s(30)),
+        ("МЗ", "Можливо заживлені", COLOR_MAYBE, _s(38)),
     ]
-    item_gap = 22
-    widths = [bw + 8 + int(draw.textlength(label, font=font_legend_lbl)) for _, label, _, bw in badges]
+    item_gap = _s(22)
+    box_pad = _s(8)
+    widths = [bw + box_pad + int(draw.textlength(label, font=font_legend_lbl)) for _, label, _, bw in badges]
     legend_w = sum(widths) + item_gap * (len(badges) - 1)
-    bx = width - 32 - legend_w
+    bx = width - margin_x - legend_w
     for tag, label, color, box_w in badges:
-        draw.rounded_rectangle([bx, 45, bx + box_w, 75], radius=4, fill=color)
-        draw.text((bx + box_w // 2, 60), tag, font=font_legend_box, fill=COLOR_DARK_TEXT, anchor="mm")
-        bx += box_w + 8
-        draw.text((bx, 60), label, font=font_legend_lbl, fill=COLOR_DARK_TEXT, anchor="lm")
+        draw.rounded_rectangle([bx, _s(45), bx + box_w, _s(75)], radius=_s(4), fill=color)
+        draw.text((bx + box_w // 2, _s(60)), tag, font=font_legend_box, fill=COLOR_DARK_TEXT, anchor="mm")
+        bx += box_w + box_pad
+        draw.text((bx, _s(60)), label, font=font_legend_lbl, fill=COLOR_DARK_TEXT, anchor="lm")
         bx += int(draw.textlength(label, font=font_legend_lbl)) + item_gap
 
     # 2. GREEN BANNER
-    draw.rounded_rectangle([32, 108, width - 32, 152], radius=8, fill=COLOR_GREEN_BANNER)
-    draw.text((52, 130), sched.month_name.capitalize(), font=font_banner_txt, fill=COLOR_DARK_TEXT, anchor="lm")
-    draw.text((width // 2 + 50, 130), "Графік погодинних відключень", font=font_banner_txt, fill=COLOR_DARK_TEXT,
+    draw.rounded_rectangle([margin_x, _s(108), width - margin_x, _s(152)], radius=_s(8), fill=COLOR_GREEN_BANNER)
+    draw.text((_s(52), _s(130)), sched.month_name.capitalize(), font=font_banner_txt, fill=COLOR_DARK_TEXT, anchor="lm")
+    draw.text((width // 2 + _s(50), _s(130)), "Графік погодинних відключень", font=font_banner_txt, fill=COLOR_DARK_TEXT,
               anchor="mm")
 
     # 3. TABLE GRID GEOMETRY
-    left_col_x0 = 32
-    left_col_w = 120
+    left_col_x0 = margin_x
+    left_col_w = _s(120)
     grid_x0 = left_col_x0 + left_col_w
-    grid_x1 = width - 32
+    grid_x1 = width - margin_x
     grid_w = grid_x1 - grid_x0
     slot_w = grid_w / 48
     hour_w = slot_w * 2
 
-    top_hour_y0 = 162
-    top_hour_y1 = 196
-    row_h = 33
+    top_hour_y0 = _s(162)
+    top_hour_y1 = _s(202)
+    marker_bar_h = _s(10)
+    row_h = _s(33)
     grid_y0 = top_hour_y1
     grid_y1 = grid_y0 + 12 * row_h
     bot_hour_y0 = grid_y1
-    bot_hour_y1 = bot_hour_y0 + 34
+    bot_hour_y1 = bot_hour_y0 + _s(34)
 
     draw.rectangle([left_col_x0, top_hour_y0, grid_x1, top_hour_y1], fill=COLOR_HOURS_BG)
     draw.text(
@@ -655,10 +705,11 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
         sched.date_str, font=font_header_h, fill=COLOR_DARK_TEXT, anchor="mm",
     )
 
+    hour_text_y = top_hour_y0 + (top_hour_y1 - top_hour_y0 - marker_bar_h) // 2
     for h in range(24):
         hx = grid_x0 + h * hour_w
-        draw.line([(hx, top_hour_y0), (hx, top_hour_y1)], fill=COLOR_BORDER, width=1)
-        draw.text((hx + hour_w / 2, (top_hour_y0 + top_hour_y1) // 2), f"{h:02d}:00", font=font_hour_h,
+        draw.line([(hx, top_hour_y0), (hx, top_hour_y1)], fill=COLOR_BORDER, width=border_w)
+        draw.text((hx + hour_w / 2, hour_text_y), f"{h:02d}:00", font=font_hour_h,
                   fill=COLOR_DARK_TEXT, anchor="mm")
 
     # 4. 12 GROUP ROWS
@@ -668,11 +719,11 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
 
         bg_grp = (255, 255, 255) if q % 2 != 0 else (248, 250, 252)
         draw.rectangle([left_col_x0, ry0, grid_x0, ry1], fill=bg_grp)
-        draw.line([(left_col_x0, ry1), (grid_x1, ry1)], fill=COLOR_BORDER, width=1)
+        draw.line([(left_col_x0, ry1), (grid_x1, ry1)], fill=COLOR_BORDER, width=border_w)
 
-        draw.text((left_col_x0 + 12, (ry0 + ry1) // 2), "Г Р У П А", font=font_grp_lbl, fill=COLOR_MUTED_GRAY,
+        draw.text((left_col_x0 + _s(12), (ry0 + ry1) // 2), "Г Р У П А", font=font_grp_lbl, fill=COLOR_MUTED_GRAY,
                   anchor="lm")
-        draw.text((grid_x0 - 18, (ry0 + ry1) // 2), str(q), font=font_grp_num, fill=COLOR_DARK_TEXT, anchor="rm")
+        draw.text((grid_x0 - _s(18), (ry0 + ry1) // 2), str(q), font=font_grp_num, fill=COLOR_DARK_TEXT, anchor="rm")
 
         q_slots = sched.slots.get(q, ["з"] * 48)
         for s in range(48):
@@ -687,14 +738,14 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
             else:
                 fill_c = COLOR_ON
 
-            draw.rectangle([sx0, ry0, sx1, ry1], fill=fill_c, outline=COLOR_BORDER, width=1)
+            draw.rectangle([sx0, ry0, sx1, ry1], fill=fill_c, outline=COLOR_BORDER, width=border_w)
             draw.text(((sx0 + sx1) // 2, (ry0 + ry1) // 2), state, font=font_cell, fill=COLOR_DARK_TEXT, anchor="mm")
 
     # 5. BOTTOM HOURS ROW
     draw.rectangle([left_col_x0, bot_hour_y0, grid_x1, bot_hour_y1], fill=COLOR_HOURS_BG)
     for h in range(24):
         hx = grid_x0 + h * hour_w
-        draw.line([(hx, bot_hour_y0), (hx, bot_hour_y1)], fill=COLOR_BORDER, width=1)
+        draw.line([(hx, bot_hour_y0), (hx, bot_hour_y1)], fill=COLOR_BORDER, width=border_w)
         draw.text((hx + hour_w / 2, (bot_hour_y0 + bot_hour_y1) // 2), f"{h:02d}:00", font=font_hour_h,
                   fill=COLOR_DARK_TEXT, anchor="mm")
 
@@ -702,16 +753,32 @@ def render_replica_table(sched: ScrapedSchedule) -> bytes:
     im = apply_watermark(im, WATERMARK_TEXT, WATERMARK_ALPHA, center_y=(grid_y0 + grid_y1) // 2)
     draw = ImageDraw.Draw(im)
 
-    # 6. CURRENT-TIME LINE
+    # 6. CURRENT-HOUR BLUE MARKER (#283f9f, moves by whole hour)
     if 0 <= sched.active_slot < 48:
-        mark_x = int(round(grid_x0 + sched.active_slot * slot_w))
-        line_layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
-        ImageDraw.Draw(line_layer).line(
-            [(mark_x, grid_y0), (mark_x, grid_y1)],
-            fill=COLOR_LINE_MARKER + (LINE_MARKER_ALPHA,),
-            width=3,
-        )
-        im = Image.alpha_composite(im.convert("RGBA"), line_layer).convert("RGB")
+        active_hour = sched.active_slot // 2
+        hx0 = int(grid_x0 + (active_hour * 2) * slot_w)
+        hx1 = int(grid_x0 + ((active_hour + 1) * 2) * slot_w)
+
+        # Bold top bar above Group 1 with 3 centered white dots
+        bar_y0 = grid_y0 - marker_bar_h
+        bar_y1 = grid_y0
+        draw.rounded_rectangle([hx0, bar_y0, hx1, bar_y1], radius=_s(3), fill=COLOR_ACTIVE_HOUR)
+
+        dot_cx = (hx0 + hx1) // 2
+        dot_cy = (bar_y0 + bar_y1) // 2
+        dot_r = max(2, _s(2))
+        dot_gap = _s(8)
+        for dx in (-dot_gap, 0, dot_gap):
+            draw.ellipse(
+                [dot_cx + dx - dot_r, dot_cy - dot_r, dot_cx + dx + dot_r, dot_cy + dot_r],
+                fill=COLOR_ACTIVE_DOTS,
+            )
+
+        # Lighter/thinner blue separator lines between each group across the active hour
+        sep_w = max(2, _s(2))
+        for q in range(1, 13):
+            ry1 = grid_y0 + q * row_h
+            draw.line([(hx0, ry1), (hx1, ry1)], fill=COLOR_ACTIVE_HOUR, width=sep_w)
 
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=True)
@@ -756,16 +823,11 @@ def build_caption(
     if tomorrow:
         if changed:
             return f"⚡️Оновлений графік знеструмлень на завтра, {uk_date}"
-        if published:
-            return f"⚡️Орієнтовний графік знеструмлень на завтра, {uk_date}"
-        return f"⚡️Орієнтовний графік знеструмлень на завтра, {uk_date}\n⏱ Станом на: <b>{sched.upd_time}</b>"
+        return f"⚡️Орієнтовний графік знеструмлень на завтра, {uk_date}"
 
     if changed:
         return "💡 Оновлений графік знеструмлень на сьогодні"
-    return (
-        f"💡 Графік знеструмлень на сьогодні, {uk_date}\n"
-        f"⏱ Станом на: <b>{sched.upd_time}</b>"
-    )
+    return f"💡 Графік знеструмлень на сьогодні, {uk_date}"
 
 
 # =========================================================================== #
@@ -798,12 +860,12 @@ async def broadcast(bot, sched: ScrapedSchedule, caption: str) -> None:
             except Forbidden as e:
                 log.warning("Removing %s (forbidden): %s", chat_id, e)
                 if chat_id not in PINNED_CHANNELS:
-                    store.remove(chat_id)
+                    await store.remove_async(chat_id)
                 break
             except BadRequest as e:
                 if "chat not found" in str(e).lower() and chat_id not in PINNED_CHANNELS:
                     log.warning("Removing %s (chat not found)", chat_id)
-                    store.remove(chat_id)
+                    await store.remove_async(chat_id)
                 else:
                     log.warning("Bad request for %s: %s", chat_id, e)
                 break
@@ -958,8 +1020,10 @@ async def post_init(app: Application) -> None:
 # Bot Handlers
 # =========================================================================== #
 async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    subscribers.add(uid)
+    user = update.effective_user
+    if user:
+        added = await subscribers.add_async(user.id)
+        log.info("User /start: uid=%s (added=%s, total=%d)", user.id, added, len(subscribers.subscribers))
 
     msg = (
         "👋 <b>Вітаємо!</b>\n\n"
@@ -1113,6 +1177,12 @@ async def on_debug_bot_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     last_fetch = scraper.last_fetch_at.strftime("%d.%m.%Y %H:%M:%S") if scraper.last_fetch_at else "ще не було"
     err_str = scraper.last_fetch_error or "немає"
 
+    conflict_info = (
+        f"⚠️ {CONFLICT_COUNT} (останній: {LAST_CONFLICT_AT.strftime('%d.%m %H:%M:%S')})"
+        if CONFLICT_COUNT > 0 and LAST_CONFLICT_AT
+        else "✅ 0"
+    )
+
     sub_file_exists = "✅ є" if SUBSCRIBERS_FILE.exists() else "⚪️ немає"
     ch_file_exists = "✅ є" if CHANNELS_FILE.exists() else "⚪️ немає"
 
@@ -1138,6 +1208,7 @@ async def on_debug_bot_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         f"• Веб-порт Gradio: <code>{os.environ.get('PORT', '7860')}</code>\n\n"
         f"<b>Моніторинг і мережа:</b>\n"
         f"• Фоновий цикл: <b>{monitor_status}</b>\n"
+        f"• Конфлікти polling (Conflict): <b>{conflict_info}</b>\n"
         f"• HTTP-сесія скрапера: <b>{http_state}</b>\n"
         f"• Останній запит: <b>{last_fetch}</b>\n"
         f"• Запитів OK / помилок: <b>{scraper.fetch_ok_count}</b> / <b>{scraper.fetch_err_count}</b>\n"
@@ -1188,7 +1259,7 @@ async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     # A user blocked the bot -> stop sending to them
     if cm.chat.type == "private":
         if status in ("kicked", "left"):
-            subscribers.remove(chat_id)
+            await subscribers.remove_async(chat_id)
         return
 
     if cm.chat.type not in ("channel", "supergroup", "group"):
@@ -1197,7 +1268,7 @@ async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if status == "administrator":
         if getattr(cm.new_chat_member, "can_post_messages", True) is False and cm.chat.type == "channel":
             log.warning("Bot is admin in %s but cannot post messages", chat_id)
-        channels.add(chat_id)
+        await channels.add_async(chat_id)
         log.info("Added to chat %s (%s)", chat_id, cm.chat.title)
 
         sched = scraper.last_schedule or await refresh_and_notify(ctx.bot)
@@ -1208,13 +1279,16 @@ async def on_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
                 log.warning("Initial channel post failed: %s", e)
     elif status in ("left", "kicked", "member", "restricted"):
         if chat_id not in PINNED_CHANNELS:
-            channels.remove(chat_id)
+            await channels.remove_async(chat_id)
         log.info("Removed from chat %s (status=%s)", chat_id, status)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global CONFLICT_COUNT, LAST_CONFLICT_AT
     if isinstance(context.error, Conflict):
-        log.warning("Conflict detected: waiting for previous container shutdown...")
+        CONFLICT_COUNT += 1
+        LAST_CONFLICT_AT = datetime.now(TZ)
+        log.warning("Conflict detected (#%d): another instance is polling with the same BOT_TOKEN!", CONFLICT_COUNT)
         return
     log.error("Update error: %s", context.error)
 
@@ -1243,7 +1317,7 @@ def run_bot() -> None:
     app.add_error_handler(on_error)
 
     app.run_polling(
-        drop_pending_updates=True,
+        drop_pending_updates=False,
         stop_signals=None,
         allowed_updates=["message", "callback_query", "my_chat_member"],
     )
@@ -1273,9 +1347,9 @@ def get_dashboard_data():
 
 
 with gr.Blocks(title="Oblenergo Replica Bot Dashboard") as demo:
-    gr.Markdown("# ⚡ Чернівціобленерго")
+    gr.Markdown("# ⚡ Чернівціобленерго — Бот-реплікатор сайту")
     gr.Markdown(
-        "Моніторить сайт `oblenergo.cv.ua/shutdowns/` та надсилає візуальну таблицю в Telegram при кожній зміні."
+        "Моніторить сайт `oblenergo.cv.ua/shutdowns/` та надсилає візуальну репліку таблиці в Telegram при кожній зміні."
     )
 
     with gr.Row():
